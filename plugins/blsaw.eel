@@ -1,0 +1,132 @@
+//////////////////////////////////////////////////////
+// blsaw.eel - Slightly less basic synth
+// Copyright (C) 2010 David Olofson
+//////////////////////////////////////////////////////
+
+module blsaw;
+
+import "synthapi";
+import "math";
+
+
+static presets = table [
+	.Organ	table [
+		.decay		0.,
+		.release	44.1
+	],
+	.Piano	table [
+		.decay		2.2,
+		.release	2.2
+	]
+];
+
+
+function Create(cfg, preset)
+{
+	local t = table [
+		.out		nil,
+		.gate		0.,
+		.vel		0.,
+		.mod		0.,
+		.ff		cfg.fc0 * 2. * PI / cfg.fs,
+		.ph		0.,
+		.phinc		1.,
+		.amp		0.,
+		.decay		preset.decay / cfg.fs,
+		.release	preset.release / cfg.fs,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					// Latch velocity and reset phase!
+					self.amp = self.vel;
+					self.ph = 0.;
+				}
+			  }
+			  case VEL
+				self.vel = value;
+			  case MOD
+				self.mod = value;
+			  case PITCH
+				self.phinc = self.ff * 2. ** value;
+		}
+		function Process(self, frames)
+		{
+			if not self.out or not self.amp
+				return false;
+			local out, local amp, local ph, local phinc
+				= self.(out, amp, ph, phinc);
+			local damp = 0.;
+			local running = true;
+			if amp < .0001
+				damp = -self.vel * .0001;
+			else
+			{
+				if self.gate
+					damp = -amp * self.decay;
+				else
+					damp = -self.vel * self.release;
+			}
+			if -damp * frames >= amp
+			{
+				// Too short! Fit it to one fragment.
+				damp = -amp / frames;
+				// We're done after this fragment!
+				self.amp = 0.;
+				running = false;
+			}
+			local maxi = 2. * PI / phinc * .3 |<
+					(1. + amp ** 2 * self.mod * 50.);
+			for local s = 0, frames - 1
+			{
+				local v = 0.;
+				for local i = 1, maxi
+					v += sin(ph * i) / i;
+				// Fade the partial at cut-off in and out, to
+				// avoid zipper noise when sweeping the filter!
+				local i = (integer)maxi + 1;
+				v += sin(ph * i) / i * (maxi % 1.);
+				out[s] += v * amp;
+				ph += phinc;
+				amp += damp;
+			}
+			self.(ph, amp) = ph, amp;
+			return running;
+		}
+	];
+	return t;
+}
+
+
+export function Descriptor
+{
+	return table [
+		.Name		"BLSaw",
+		.Author		"David Olofson",
+		.Copyright	"Copyright (C) 2010 David Olofson",
+		.Create		Create,
+		function ListPresets(self)
+		{
+			local names = [];
+			for local i = 0, sizeof presets - 1
+				names.+ key(presets, i);
+			return names;
+		}
+		function GetPreset(self, name)
+		{
+			if name == "Default"
+				return presets.Piano;
+			return presets[name];
+		}
+	];
+}

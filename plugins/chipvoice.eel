@@ -1,0 +1,558 @@
+//////////////////////////////////////////////////////
+// chipvoice.eel - ChipVoice prototype implementation
+// Copyright (C) 2007, 2010 David Olofson
+//
+// Differences from the C implementation:
+//	* Registers are float; not 16:16 fixed point
+//	* Oscillators use linear interpolation only
+//	* There is no voice control de-clicking
+//	* No optimizations for silent oscillators etc
+//	* ChipVoice cannot instantiate without a Patch
+//	* The "tick rate" is locked at 1002.3 Hz.
+//////////////////////////////////////////////////////
+
+module chipvoice;
+
+import "synthapi";
+import "math", "dsp";
+
+
+constant MIPS = 11;		// Number of waveform mip-maps
+constant NINS = 32;		// Number of control input ports
+constant NOUTS = 32;		// Number of control output ports
+constant NREGS = 256;		// Number of general purpose VM registers
+
+
+///////////////////////////////////////
+// Voice control ports
+///////////////////////////////////////
+
+// The first stage is a programmable noise generator. Note that
+// there is no gain control for this stage, as that function is
+// covered by the BYPASS control of the first oscillator.
+// V_N_MODE	Noise output mode:
+//			0	Disabled
+//			1	S&H, "C64 style"
+//			2	S&H with linear ramping
+//			3	S&H with cubic interpolation
+// V_N_PITCH	Sample & hold rate (linear pitch)
+// V_N_HPF	6 dB/oct high pass filter cutoff (linear pitch)
+export constant V_N_MODE = 0;
+export constant V_N_PITCH = 1;
+export constant V_N_HPF = 2;
+
+// The next two stages are oscillators. Each of these, in order,
+// output a mix of the signal from the previous stage, the raw
+// oscillator output, and the oscillator output ring modulated
+// with the signal from the previous stage. The oscillators can
+// be phase modulated by their input signals.
+// V_Ox_WAVE0	Primary or waveform index (integer)
+//		(Auto crossfade: New waveform)
+// V_Ox_WAVE1	Secondary waveform index (integer)
+//		(Auto crossfade: Previous waveform; read-only)
+// V_Ox_BALANCE	Waveform balance (0.0 ==> primary, 1.0 ==>
+//		secondary, -N ==> automatically crossfade to new
+//		waveform over N control cycles)
+// V_Ox_PITCH	Oscillator pitch (linear pitch)
+// V_Ox_PM	Phase modulation depth (periods for 1.0 input)
+// V_Ox_PHASE	Oscillator phase accumulator ([0.0, 1.0[)
+// V_Ox_BYPASS	Input signal bypass level (1.0 <==> unity gain)
+// V_Ox_GAIN	Oscillator output level (1.0 <==> unity gain)
+// V_Ox_RING	Ringmod output level (1.0 <==> unity gain)
+export constant V_O0_WAVE0 = 8;
+export constant V_O0_WAVE1 = 9;
+export constant V_O0_BALANCE = 10;
+export constant V_O0_PITCH = 11;
+export constant V_O0_PM = 12;
+export constant V_O0_PHASE = 13;
+export constant V_O0_BYPASS = 14;
+export constant V_O0_GAIN = 15;
+export constant V_O0_RING = 16;
+
+export constant V_O1_WAVE0 = 24;
+export constant V_O1_WAVE1 = 25;
+export constant V_O1_BALANCE = 26;
+export constant V_O1_PITCH = 27;
+export constant V_O1_PM = 28;
+export constant V_O1_PHASE = 29;
+export constant V_O1_BYPASS = 30;
+export constant V_O1_GAIN = 31;
+export constant V_O1_RING = 32;
+
+// The waveshaper transforms the output from the last oscillator
+// by indexing output values out of a 4 point table, using
+// quadratic and cubic interpolation.
+// V_SHAPE_C0	Output value for input -1.0
+// V_SHAPE_C1	Output value for input -0.5
+// V_SHAPE_C2	Output value for input +0.5
+// V_SHAPE_C3	Output value for input +1.0
+export constant V_SHAPE_C0 = 40;
+export constant V_SHAPE_C1 = 41;
+export constant V_SHAPE_C2 = 42;
+export constant V_SHAPE_C3 = 43;
+
+// The 12 dB/oct resonant filter has pitch (f0) and resonance (Q)
+// controls. It's output is a mix of the unfiltered input, the
+// lowpass output from the filter, and the resonant peaking output
+// from the filter. This alows the filter to be configured as low
+// pass, high pass, notch, peak or anything in between, or any
+// combination of these.
+export constant V_F_PITCH = 48;
+export constant V_F_Q = 49;
+export constant V_F_BYPASS = 50;
+export constant V_F_LP = 51;
+export constant V_F_PK = 52;
+
+/*
+export constant V_GAIN_L = 56;
+export constant V_GAIN_R = 57;
+*/
+
+export constant NVPORTS = 64;
+
+
+// Base preset constructor
+function Preset
+{
+	local t = table [
+		.waves	[],		// Table of waveforms
+//		.code	dstring [],	// VM code
+		.regs	vector [],	// Initial register values
+		procedure LoadWave(self, i, w)
+		{
+//			print("Loading waveform [", i, "]..."
+//					"  Input size: ",
+//					sizeof w, " frames.\n");
+			local wa, self.waves[i] = [clone w];
+//TODO: Use some proper resampling here...
+			// Upsample
+//			print("  Upsampling...");
+			local len = sizeof w / 2;
+			while len >= 2
+			{
+//				print(" ", len);
+				local p = wa[0];
+				local mip = vector [];
+				for local s = 0, len - 1
+					mip[s] = (p[s * 2] + p[s * 2 + 1]) / 2;
+				insert(wa, 0, mip);
+				len /= 2;
+			}
+//			print("\n");
+			// Downsample
+//			print("  Downsampling...");
+			for local ds = sizeof wa, MIPS - 1
+			{
+				local p = wa[sizeof wa - 1];
+				local mip = vector [];
+				mip[sizeof p * 2 - 1] = 0.;
+//				print(" ", sizeof mip);
+				for local s = 0, sizeof p - 1
+					mip[s * 2] = p[s];
+				for local s = 0, sizeof p - 2
+					mip[s * 2 + 1] = (p[s] + p[s + 1]) * .5;
+				mip[sizeof p * 2 - 1] = (p[0] + p[sizeof p - 1]) * .5;
+				wa.+ mip;
+			}
+//			print("\n");
+			if sizeof wa != MIPS
+				throw "Incorrect number of MIPs!";
+			for local j = 0, MIPS - 1
+				if sizeof wa[j] != 2 ** (j + 1)
+					throw "MIP " + j + "has incorrect size" +
+							sizeof wa[j] + "!";
+//			print("Waveform loaded!\n");
+		}
+	];
+	t.regs[NREGS - 1] = 0.;
+	return t;
+}
+
+
+function CreateDefaultPreset(self)
+{
+	local t = Preset();
+	local v = vector [];
+	local mm = 2 ** MIPS;
+
+	// Sine
+	for local i = 0, mm - 1
+		v[i] = sin(i * 2. * PI / mm);
+	t:LoadWave(0, v);
+
+	// Triangle
+	t:LoadWave(1, vector [0, 1, 0, -1]);
+
+	// Saw
+	for local i = 0, mm - 1
+		v[i] = 2 * i / mm - 1;
+	t:LoadWave(2, v);
+
+	// Pulse waves
+	for local ra = 0, 8
+	{
+		local sw = mm / (2 + ra * ra);
+		for local i = 0, mm - 1
+			if i < sw
+				v[i] = 1;
+			else
+				v[i] = -1;
+		t:LoadWave(3 + ra, v);
+	}
+
+	// Smooth Squares
+	local ws = 4;
+	local wi = 12;
+	while ws <= 32
+	{
+		delete(v);
+		for local i = 0, ws / 2 - 1
+			v[i, i + ws / 2] = 1, -1;
+		t:LoadWave(wi, v);
+		wi += 1;
+		ws *= 2;
+	}
+
+	// Sinesync waveforms
+	for local xp = 0, 15
+	{
+		for local i = 0, mm - 1
+			v[i] = sin(i * (2.5 + xp * 2.) * PI / mm);
+		t:LoadWave(16 + xp, v);
+	}
+	for local xp = 0, 15
+	{
+		for local i = 0, mm - 1
+			v[i] = sin(i * (3. + xp * 2.) * PI / mm);
+		t:LoadWave(32 + xp, v);
+	}
+
+	// Sine harmonics
+	for local xp = 0, 15
+	{
+		for local i = 0, mm - 1
+			v[i] = sin(i * (4. + xp * 2.) * PI / mm);
+		t:LoadWave(48 + xp, v);
+	}
+
+	return t;
+}
+
+
+// Oscillator
+function Oscillator
+{
+	local t = table [
+		.waves		[],	// Waveforms
+		.balance	0.,	// Waveform balance
+		.last_balance	0.,	// Waveform balance, last value
+		.bypass		1.,	// Input bypass level
+		.last_bypass	1.,	// Input bypass level, last value
+		.gain		1.,	// Addition level
+		.last_gain	1.,	// Addition level, last value
+		.ring		0.,	// Ringmod level
+		.last_ring	0.,	// Ringmod level, last value
+		.phinc		1.,	// Phase increment
+		.phase		0.,	// Phase accumulator
+		procedure SetWave(self, i, w)
+		{
+			if self.balance >= 0
+				self.waves[i] = w;
+			else
+			{
+				self.waves[1] = self.waves[0];
+				self.waves[0] = w;
+				self.last_balance = 1.;
+			}
+		}
+		procedure Process(self, frames)
+		{
+			local new_bypass = self.bypass;
+			local new_gain = self.gain;
+			local new_ring = self.ring;
+
+			// Pitch and mipmapping
+			local mip = log(1. / (self.phinc >| .00001)) / log(2.) - 1;
+			mip = (integer)mip |< (MIPS - 1);
+			if mip < 0
+			{
+				// Mute when above Nyqvist!
+				// NOTE: We can't just bail out here, as we need
+				//       to keep phase, ramping etc running! We
+				//       *could* bypass the inner loop, though.
+				mip = 0;
+				new_gain, new_ring = 0.;
+			}
+			local w0 = self.waves[0][mip];
+			local w1 = self.waves[1][mip];
+			local ws = sizeof(w0);
+			local lmask = ws - 1;
+			local ph = self.phase * ws;
+			local phi = self.phinc * ws;
+			self.phase += self.phinc * frames;
+			// FP specific hack; not needed for integer/fixed point
+			if self.phase > 1.
+				self.phase -= 1.;
+
+			// Balance/auto crossfade
+			local bnew = self.balance;
+			local b = self.last_balance;
+			if bnew < -.5
+			{
+				bnew = b + 1. / floor(bnew + .5);
+				// Stop condition + rounding error trap
+				if bnew < -.5 / self.balance
+					bnew = 0.;
+			}
+			else
+				bnew >|= 0.;
+			local db = (bnew - b) / frames;
+			self.last_balance = bnew;
+
+			// Bypass
+			local bypass = self.last_bypass;
+			local dbypass = (new_bypass - bypass) / frames;
+			self.last_bypass = new_bypass;
+
+			// Gain
+			local gain = self.last_gain;
+			local dgain = (new_gain - gain) / frames;
+			self.last_gain = new_gain;
+
+			// Ring
+			local ring = self.last_ring;
+			local dring = (new_ring - ring) / frames;
+			self.last_ring = new_ring;
+
+			// DSP loop
+			local o = self.out;
+			for local s = 0, frames - 1
+			{
+				local i = (integer)ph;
+				local f = ph - i;
+				local i1 = i & lmask;
+				local i0 = (i + 1) & lmask;
+				local rf = 1. - f;
+				local s0 = w0[i0] * f + w0[i1] * rf;
+				local s1 = w1[i0] * f + w1[i1] * rf;
+				local so = s0 * (1. - b) + s1 * b;
+				o[s] = o[s] * bypass + so * (gain + o[s] * ring);
+				b += db;
+				bypass += dbypass;
+				gain += dgain;
+				ring += dring;
+				ph += phi;
+			}
+		}
+	];
+	return t;
+}
+
+
+// Noise Generator
+function NoiseGen
+{
+	local t = table [
+		procedure Process(self, frames)
+		{
+			local o = self.out;
+			for local s = 0, frames - 1
+				o[s] = 0.;
+		}
+	];
+	return t;
+}
+
+
+// ChipVoice constructor
+function Create(cfg, preset)
+{
+	local t = table [
+		.regs	copy(preset.regs),	// VM work regs
+		.ins	vector [],		// Input control ports
+		.vports	vector [],		// Voice control ports
+//		.code	preset.code,		// Patch VM code
+		.waves	preset.waves,		// Patch waveforms
+		.noise	NoiseGen(),
+		.osc0	Oscillator(),
+		.osc1	Oscillator(),
+		.ff	cfg.fc0 / cfg.fs,
+		.mixbuf	vector [],
+		.out	nil,
+	.wcnt 	0,
+	.w	0,
+	.vel	1.,
+	.mod	0.,
+	.amp	0.,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer;
+		}
+		procedure Control(self, ctrl, val)
+		{
+/////////////////////////////////////////////////////////////////////////
+// This hack is a placeholder for VM code
+/////////////////////////////////////////////////////////////////////////
+			switch ctrl
+			  case GATE
+			  {
+				if val
+					self.amp = self.vel;
+				else
+					self.amp = 0.;
+//				if val
+//					val = self.vel;
+//				self:VControl(V_GAIN_L, val);
+//				self:VControl(V_GAIN_R, val);
+			  }
+			  case VEL
+				self.vel = val;
+			  case PITCH
+			  {
+//				self:VControl(V_O0_PITCH, val - .003);
+//				self:VControl(V_O1_PITCH, val + 5. / 12. + .003);
+				self:VControl(V_O0_PITCH, val - .003);
+				self:VControl(V_O1_PITCH, val + .003);
+//				self:VControl(V_O0_PITCH, val - .002);
+//				self:VControl(V_O1_PITCH, val + 7. / 12. + .002);
+
+			  }
+			  case MOD
+			  {
+				self.mod = val;
+				local ival = 1. - val;
+				self:VControl(V_O0_BALANCE, -ival*abs(ival) * 150);
+				self:VControl(V_O1_BALANCE, val);
+			  }
+			self.ins[ctrl] = val;
+/////////////////////////////////////////////////////////////////////////
+		}
+		function Process(self, frames)
+		{
+			if not self.amp
+				return false;
+			// Control processing
+/////////////////////////////////////////////////////////////////////////
+// This hack is a placeholder for VM code
+/////////////////////////////////////////////////////////////////////////
+			self.wcnt += 1;
+			if self.wcnt > 150
+			{
+				self.wcnt = 0;
+/*				self.w += 11;
+				self.osc0:SetWave(0, self.waves[self.w %
+						sizeof self.waves]);*/
+				self.w += 10;
+				self.osc0:SetWave(0, self.waves[48 + self.w % 16]);
+			}
+			local env = (150. - self.wcnt) / 150.;
+			env = env * self.mod + 1. - self.mod;
+			self.osc1.ring = env * .7 + .3;
+			self.osc1.bypass = (1. - env) * .3;
+			self.osc1.gain = (1. - env) * .3;
+/////////////////////////////////////////////////////////////////////////
+
+			// Audio processing
+			self.noise:Process(frames);
+			self.osc0:Process(frames);
+			self.osc1:Process(frames);
+// TODO: Waveshaper
+// TODO: Filter
+			self.out.#+ self.mixbuf #* self.amp;
+			return true;
+		}
+		procedure VControl(self, ctrl, val)
+		{
+			switch ctrl
+			  // Oscillator 0
+			  case V_O0_WAVE0
+				self.osc0:SetWave(0, val);
+			  case V_O0_WAVE1
+				self.osc0:SetWave(1, val);
+			  case V_O0_BALANCE
+				self.osc0.balance = val;
+			  case V_O0_PITCH
+				self.osc0.phinc = self.ff * 2. ** val;
+			  case V_O0_PM
+/*TODO:*/			;
+			  case V_O0_PHASE
+/*TODO:*/			;
+			  case V_O0_BYPASS
+				self.osc0.bypass = val;
+			  case V_O0_GAIN
+				self.osc0.gain = val;
+			  case V_O0_RING
+				self.osc0.ring = val;
+
+			  // Oscillator 1
+			  case V_O1_WAVE0
+				self.osc1:SetWave(0, val);
+			  case V_O1_WAVE1
+				self.osc1:SetWave(1, val);
+			  case V_O1_BALANCE
+				self.osc1.balance = val;
+			  case V_O1_PITCH
+				self.osc1.phinc = self.ff * 2. ** val;
+			  case V_O1_PM
+/*TODO:*/			;
+			  case V_O1_PHASE
+/*TODO:*/			;
+			  case V_O1_BYPASS
+				self.osc1.bypass = val;
+			  case V_O1_GAIN
+				self.osc1.gain = val;
+			  case V_O1_RING
+				self.osc1.ring = val;
+			self.vports[ctrl] = val;
+		}
+	];
+//TODO: Default input port state?
+	t.ins[NINS - 1] = 0.;
+//TODO: Default voice port state?
+	t.vports[NVPORTS - 1] = 0.;
+//TODO: What about auto crossfade and initial state?
+	t.osc0:SetWave(0, preset.waves[0]);
+	t.osc0:SetWave(1, preset.waves[0]);
+	t.osc1:SetWave(0, preset.waves[12]);
+	t.osc1:SetWave(1, preset.waves[15]);
+	t.(noise, osc0, osc1).out = t.mixbuf;
+
+	t:VControl(V_O0_BALANCE, -1.);
+	t:VControl(V_O0_GAIN, .7);
+
+	t:VControl(V_O1_BALANCE, 0.);
+	t:VControl(V_O1_BYPASS, 0.);
+	t:VControl(V_O1_GAIN, 0.);
+	t:VControl(V_O1_RING, 1.);
+
+	return t;
+}
+
+
+export function Descriptor
+{
+	return table [
+		.Name		"ChipVoice Prototype",
+		.Author		"David Olofson",
+		.Copyright	"Copyright (C) 2007, 2010 David Olofson",
+		.Create		Create,
+		.presets	table [
+			.Default	table [
+				.Create	CreateDefaultPreset
+			]
+		],
+		function ListPresets(self)
+		{
+			local names = [];
+			for local i = 0, sizeof self.presets - 1
+				names.+ key(self.presets, i);
+			return names;
+		}
+		function GetPreset(self, name)
+		{
+			return self.presets[name]:Create();
+		}
+	];
+}

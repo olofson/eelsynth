@@ -1,0 +1,1133 @@
+//////////////////////////////////////////////////////////////////
+// fftsynth.eel - Simple FFT Synth - EELSynth version
+// Copyright (C) 2006, 2010, 2011 David Olofson
+//////////////////////////////////////////////////////////////////
+
+module fftsynth;
+
+import "synthapi";
+import "math";
+import "dsp" as dsp;
+
+
+ // FFT engine constants
+//////////////////////////////////////////
+
+constant FFTSIZE = 512;		// FFT window size
+
+
+ // Pseudo-random number generator
+//////////////////////////////////////////
+
+static last = 42;
+
+export function rnd(max)
+{
+	last = (last * 3877 + 29573) % 139968;
+	return (max * last) / 139968;
+}
+
+
+constant add_polar_i = dsp.c_add_polar_i;
+
+
+ // Instrument definitions
+//////////////////////////////////////////
+
+// Basic sine with vibrato, corresponding to sine.eel
+function Sine(cfg)
+{
+	return table [
+		.out		nil,	// Output buffer (FFT spectrum!)
+		.gate		0.,	// GATE
+		.vel		0.,	// VEL
+		.ff_c0		cfg.fc0 / cfg.fs,	// C0
+		.ff_1		2. * PI / cfg.fs,	// 1 Hz
+		.ph		0.,	// Oscillator phase
+		.phinc		1.,	// Oscillator phase increment
+		.amp		0.,	// Amplitude
+		.vib		0.,
+		.lfo_ph		0.,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer.fd;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					// Latch velocity and reset phase!
+					self.amp = self.vel;
+					self.ph = 0.;
+					self.lfo_ph = 0.;
+				}
+			  }
+			  case VEL
+				self.vel = value;
+			  case PITCH
+				self.phinc = self.ff_c0 * 2. ** value;
+			  case MOD
+				self.vib = .1 * value ** 2.;
+		}
+		function Process(self, frames)
+		{
+			if not self.out or not self.gate
+				return false;
+			local lfo = sin(self.lfo_ph) * self.vib;
+			self.lfo_ph += self.ff_1 * 5. * frames;
+			local phinc = self.phinc * (1. + lfo);
+			local f = phinc * FFTSIZE;
+			if self.gate
+				add_polar_i(self.out, f, self.amp, self.ph);
+			self.ph += phinc * 2. * PI * frames;
+			return true;
+		}
+	];
+}
+
+
+// Narrowband pitched noise
+function NBNoise(cfg)
+{
+	return table [
+		.out		nil,	// Output buffer (FFT spectrum!)
+		.gate		0.,	// GATE
+		.vel		0.,	// VEL
+		.ff_c0		cfg.fc0 / cfg.fs,	// C0
+		.ff_1		2. * PI / cfg.fs,	// 1 Hz
+		.ph		0.,	// Oscillator phase
+		.phinc		1.,	// Oscillator phase increment
+		.amp		0.,	// Amplitude
+		.vib		0.,
+		.lfo_ph		0.,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer.fd;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					// Latch velocity and reset phase!
+					self.amp = self.vel;
+					self.ph = 0.;
+					self.lfo_ph = 0.;
+				}
+			  }
+			  case VEL
+				self.vel = value;
+			  case PITCH
+				self.phinc = self.ff_c0 * 2. ** value;
+			  case MOD
+				self.vib = .1 * value ** 2.;
+		}
+		function Process(self, frames)
+		{
+			if not self.out or not self.gate
+				return false;
+			local lfo = sin(self.lfo_ph) * self.vib;
+			self.lfo_ph += self.ff_1 * 5. * frames;
+			local phinc = self.phinc * (1. + lfo);
+			local f = phinc * FFTSIZE;
+			if self.gate
+				add_polar_i(self.out, f, self.amp, self.ph);
+			self.ph += phinc * 2. * PI * frames;
+			if self.ph > 2. * PI
+				self.ph = rnd(2. * PI);
+			return true;
+		}
+	];
+}
+
+
+function Flute(cfg)
+{
+	constant FASTDECAY = .1;
+	constant SLOWDECAY = .01;
+	constant GLISSANDO = .3;
+	constant NOISEBINS = 50;
+	local o = table [
+		.out		nil,
+		.gate		0.,
+		.vel		0.,
+		.ff_c0		cfg.fc0 / cfg.fs,
+		.ff_1		2. * PI / cfg.fs,
+		.a		0,
+		.ta		0,
+		.d		FASTDECAY,
+		.nphinc		0,
+		.phinc		0,
+		.ph		0.,
+		.ndph		vector [],
+		.na		vector [],
+		.na0		0.,
+		.expr		0,
+		.vib		0.,
+		.lfo_ph		0.,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer.fd;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					self.ta = self.vel;
+					if self.expr
+						self.na0 = self.vel * .4;
+					else
+						self.na0 = self.vel;
+				}
+				else
+					self.ta = 0;
+			  }
+			  case VEL
+				self.vel = value;
+			  case PITCH
+				self.nphinc = self.ff_c0 * 2. ** value;
+			  case MOD
+				self.vib = value ** 2.;
+			  case EXPR
+			  {
+				self.expr = value;
+				if value
+					self.d = SLOWDECAY;
+				else
+					self.d = FASTDECAY;
+			  }
+		}
+		function Process(self, frames)
+		{
+			if not self.out or (not self.a and not self.ta)
+				return false;
+			// MOD controlled LFO
+			local vib = sin(self.lfo_ph) * self.vib;
+			// Tremolo
+			local a = self.a * (1 + vib * .3);
+			local na0 = self.na0 * (1 + vib * .7) * (.5 + .5 * a);
+			// "Human feel" + vibrato
+			local lfo = sin(self.lfo_ph * .425) * .005 +
+					sin(self.lfo_ph * .275) * .002 +
+					vib * .02;
+			self.lfo_ph += self.ff_1 * 5. * frames;
+			local phinc = self.phinc * (1. + lfo);
+			local f = phinc * FFTSIZE;
+			local na = self.na;
+			local ndph = self.ndph;
+			local out = self.out;
+			add_polar_i(out, f, a * .3, self.ph);
+			add_polar_i(out, f * 2.01, a * .8, self.ph * 2.01);
+			add_polar_i(out, f * 3.02, a * .08, self.ph * 3.02);
+			add_polar_i(out, f * 4.03, a * .1, self.ph * 4.03);
+			add_polar_i(out, f * 5.04, a * .08, self.ph * 5.04);
+			add_polar_i(out, f * 6.05, a * .06, self.ph * 6.05);
+			add_polar_i(out, f * 7.06, a * .05, self.ph * 7.06);
+			for local i = 0, NOISEBINS - 1
+				add_polar_i(out, ndph[i] * FFTSIZE,
+						na0 * na[i],
+						rnd(2. * PI));
+			local dph = phinc * 2. * PI * frames;
+			self.ph += dph;
+			self.phinc += (self.nphinc - self.phinc) * GLISSANDO;
+			self.a += (self.ta - self.a) * self.d;
+			self.na0 += ((self.a * .15) - self.na0) * .03;
+			if self.a < 0.001
+			{
+				self.a = 0.;
+				return false;
+			}
+			else
+				return true;
+		}
+	];
+	for local i = 0, NOISEBINS - 1
+	{
+		o.na.+ .05 + .15 / (1 + i);
+		o.ndph.+ o.ff_c0 * 2. ** (2 + rnd(.2) + i * .065);
+	}
+	return o;
+}
+
+
+function Flute2(cfg)
+{
+	constant FASTDECAY = .1;
+	constant SLOWDECAY = .01;
+	constant GLISSANDO = .5;
+	constant NOISEBINS = 50;
+	local o = table [
+		.out		nil,
+		.gate		0.,
+		.vel		0.,
+		.ff_c0		cfg.fc0 / cfg.fs,
+		.ff_1		2. * PI / cfg.fs,
+		.a		0,
+		.ta		0,
+		.d		FASTDECAY,
+		.nphinc		0,
+		.phinc		0,
+		.ph		0.,
+		.ndph		vector [],
+		.na		vector [],
+		.na0		0.,
+		.expr		0,
+		.vib		0.,
+		.lfo_ph		0.,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer.fd;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					self.ta = self.vel;
+					if self.expr
+						self.na0 = self.vel * .4;
+					else
+						self.na0 = self.vel;
+				}
+				else
+					self.ta = 0;
+			  }
+			  case VEL
+				self.vel = value;
+			  case PITCH
+				self.nphinc = self.ff_c0 * 2. ** value;
+			  case MOD
+				self.vib = value ** 2.;
+			  case EXPR
+			  {
+				self.expr = value;
+				if value
+					self.d = SLOWDECAY;
+				else
+					self.d = FASTDECAY;
+			  }
+		}
+		function Process(self, frames)
+		{
+			if not self.out or (not self.a and not self.ta)
+				return false;
+			// MOD controlled LFO
+			local vib = sin(self.lfo_ph) * self.vib;
+			// Tremolo
+			local a = self.a * (1 + vib * .3);
+			local na0 = self.na0 * (1 + vib * .7) * (.5 + .5 * a);
+			// "Human feel" + vibrato
+			local lfo = sin(self.lfo_ph * .425) * .005 +
+					sin(self.lfo_ph * .275) * .002 +
+					vib * .02;
+			self.lfo_ph += self.ff_1 * 5. * frames;
+			local phinc = self.phinc * (1. + lfo);
+			local f = phinc * FFTSIZE;
+			local na = self.na;
+			local ndph = self.ndph;
+			local out = self.out;
+			add_polar_i(out, f, a * .7, self.ph);
+			add_polar_i(out, f * 2.01, a * .2, self.ph * 2.01);
+			add_polar_i(out, f * 2.98, a * .05, self.ph * 2.98);
+			add_polar_i(out, f * 4.03, a * .05, self.ph * 4.03);
+			for local i = 0, NOISEBINS - 1
+				add_polar_i(out, ndph[i] * FFTSIZE,
+						na0 * na[i],
+						rnd(2. * PI));
+			local dph = phinc * 2. * PI * frames;
+			self.ph += dph;
+			self.phinc += (self.nphinc - self.phinc) * GLISSANDO;
+			self.a += (self.ta - self.a) * self.d;
+			self.na0 += ((self.a * .15) - self.na0) * .03;
+			if self.a < 0.001
+			{
+				self.a = 0.;
+				return false;
+			}
+			else
+				return true;
+		}
+	];
+	for local i = 0, NOISEBINS - 1
+	{
+		o.na.+ .03 + .07 / (1 + i);
+		o.ndph.+ o.ff_c0 * 2. ** (3 + rnd(.2) + i * .05);
+	}
+	return o;
+}
+
+
+function BLSaw(cfg)
+{
+	return table [
+		.out		nil,	// Output buffer (FFT spectrum!)
+		.gate		0.,	// GATE
+		.vel		0.,	// VEL
+		.ff_c0		cfg.fc0 / cfg.fs,	// C0
+		.ff_1		2. * PI / cfg.fs,	// 1 Hz
+		.ph		0.,	// Oscillator phase
+		.phinc		1.,	// Oscillator phase increment
+		.amp		0.,	// Amplitude
+		.mod		0.,
+		.decay		2.2 / cfg.fs,
+		.release	2.2 / cfg.fs,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer.fd;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					// Latch velocity and reset phase!
+					self.amp = self.vel;
+					self.ph = 0.;
+				}
+			  }
+			  case VEL
+				self.vel = value;
+			  case MOD
+				self.mod = value;
+			  case PITCH
+				self.phinc = self.ff_c0 * 2. ** value;
+		}
+		function Process(self, frames)
+		{
+			if not self.out or self.amp <= 0.
+				return false;
+			local amp = self.amp;
+			local damp = 0.;
+			local running = true;
+			if amp < .0001
+				damp = -self.vel * .0001;
+			else
+			{
+				if self.gate
+					damp = -amp * self.decay;
+				else
+					damp = -self.vel * self.release;
+			}
+			if -damp * frames >= amp
+			{
+				// Too short! Fit it to one fragment.
+				damp = -amp / frames;
+				// We're done after this fragment!
+				self.amp = 0.;
+				running = false;
+			}
+			local maxi = 1. + amp * self.mod * 100.;
+			local f = self.phinc * FFTSIZE;
+			local o, local a, local ph = self.(out, amp, ph);
+			for local i = 1, maxi
+				add_polar_i(o, f * i, a / i, ph * i);
+			local i = (integer)maxi + 1;
+			add_polar_i(o, f * i, a / i * (maxi % 1.), ph * i);
+			self.ph += self.phinc * 2. * PI * frames;
+			self.amp += damp * frames;
+			return running;
+		}
+	];
+}
+
+
+function ResoSaw(cfg)
+{
+	local t = BLSaw(cfg);
+	t.Process = function(self, frames)
+		{
+			if not self.out or self.amp <= 0.
+				return false;
+			local amp = self.amp;
+			local damp = 0.;
+			local running = true;
+			if amp < .0001
+				damp = -self.vel * .0001;
+			else
+			{
+				if self.gate
+					damp = -amp * self.decay;
+				else
+					damp = -self.vel * self.release;
+			}
+			if -damp * frames >= amp
+			{
+				// Too short! Fit it to one fragment.
+				damp = -amp / frames;
+				// We're done after this fragment!
+				self.amp = 0.;
+				running = false;
+			}
+			local maxi = 1. + amp ** 1.5 * self.mod * 100.;
+			local f = self.phinc * FFTSIZE;
+			local o, local a, local ph = self.(out, amp, ph);
+			a /= 1 + maxi * .2;
+			for local i = 1, maxi
+				add_polar_i(o, f * i, a, ph * i);
+			local i = (integer)maxi + 1;
+			add_polar_i(o, f * i, a * (maxi % 1.), ph * i);
+			self.ph += self.phinc * 2. * PI * frames;
+			self.amp += damp * frames;
+			return running;
+		};
+	return t;
+}
+
+
+function Bass(cfg)
+{
+	constant FASTDECAY = .995;
+	constant SLOWDECAY = .9995;
+	constant FILTERDECAY = .99;
+	constant SEQ_FILTERDECAY = .97;
+	constant OSCILLATORS = 50;
+	constant MINCUT = 1;
+	constant MAXCUT1 = 2;
+	constant MAXCUT2 = 16;
+	local o = table [
+		.out	nil,
+		.ff_c0	cfg.fc0 / cfg.fs,	// C0
+		.a	0,
+		.d	FASTDECAY,
+		.fa	0,
+		.fd	FILTERDECAY,
+		.maxcut	MAXCUT2,
+		.cnt	1,
+		.seq	false,
+		.reso	0,
+		.resom	0,
+		.resoph	0,
+		.phinc	1.,
+		.ph	vector[],
+		.dph0	vector[],
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer.fd;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+					self.(a, d, fa) = 1, SLOWDECAY, 1;
+				else
+					self.d = FASTDECAY;
+			  }
+			  case VEL
+				self.vel = value;
+			  case PITCH
+				self.phinc = self.ff_c0 * 2. ** value;
+			  case MOD
+				self.reso = value;
+			  case EXPR
+			  {
+				self.seq = value;
+				if value
+				{
+					self.fd = SEQ_FILTERDECAY;
+					self.cnt = 1;
+				}
+				else
+					self.(fd, maxcut) = FILTERDECAY, MAXCUT2;
+			  }
+		}
+		function Process(self, frames)
+		{
+			if not self.out or not self.a
+		{
+		print("[1]\n");
+				return false;
+		}
+			if self.seq and self.gate
+			{
+				self.cnt -= 1;
+				if not self.cnt
+				{
+					self.cnt = 192;
+					self.maxcut = MAXCUT1 +
+							rnd(MAXCUT2 - MAXCUT1);
+					self.a = .95;
+					self.fa = .85;
+				}
+				self.a >|= .75;
+			}
+			local out = self.out;
+			local dph0, local ph = self.(dph0, ph);
+			local f = self.phinc * FFTSIZE;
+			ph.#+ dph0 #* (self.phinc * 2. * PI * frames);
+			local a = (.5 - self.reso * .3) * self.a ** 7;
+			local cutoff = self.fa ** 3;
+			cutoff = (MINCUT + self.reso *
+					(self.maxcut - MINCUT)) *
+					(1 - cutoff) +
+					(OSCILLATORS - 1) * cutoff;
+			local r = self.reso * 30;
+			for local h = 0, cutoff
+			{
+				local m = a / (h + 1.5);
+				// Filter peak
+				m *= 1 + r * (h / cutoff) ** 3;
+				add_polar_i(out, f * dph0[h], m, ph[h]);
+			}
+
+			// Smooth roll-off...
+			local frac = cutoff - floor(cutoff);
+			local cco = ceil(cutoff);
+			local i = f * dph0[cco];
+			local m = a / (cutoff + 1.5);
+			m *= 1 + self.reso * 20;
+			add_polar_i(out, i, m * frac, ph[cco]);
+
+			// Bass enhancer
+			add_polar_i(out, f * dph0[0] * .5,
+					.1 * self.a ** 5, ph[0] * .5);
+
+			// Filter frequency
+			self.resoph += cutoff * f * 2. * PI * frames;
+
+			// Filter resonance: Excitation
+			self.resom += m * self.reso;
+
+			// Filter resonance: Damping
+			self.resom *= .5 + .3 * self.reso;
+
+			// Filter resonance: Saturation
+			self.resom |<= 1;
+
+			// Filter output + distortion
+			for local h = 1, 30, 2
+				add_polar_i(out, cutoff * f * h,
+						.2 * self.resom ** h / h,
+						self.resoph * h);
+
+			// Update envelopes
+			self.a *= self.d;
+			self.fa *= self.fd;
+			if self.a < 0.001
+			{
+				self.a = 0.;
+		print("[2]\n");
+				return false;
+			}
+			else
+		{
+		print("[3]\n");
+				return true;
+		}
+		}
+	];
+	for local i = 1, OSCILLATORS
+	{
+		o.ph.+ rnd(2 * PI);
+		o.dph0.+ i;
+	}
+	return o;
+}
+
+
+function PadSynth(cfg, oscillators, voices, base, spread)
+{
+//	constant FASTDECAY = .2;
+//	constant SLOWDECAY = .02;
+//	constant GLISSANDO = .4;
+	constant FASTDECAY = 1;
+	constant SLOWDECAY = .007;
+	constant GLISSANDO = 1;
+	local o = table [
+		.out	nil,
+		.oscillators	oscillators,
+		.voices		voices,
+		.spread		spread,
+		.ff_c0	cfg.fc0 / cfg.fs,
+		.ff_1	2. * PI / cfg.fs,
+		.a	0,
+		.ta	0,
+		.d	FASTDECAY,
+		.nphinc	0,
+		.phinc	0,
+		.vel	0,
+		.vib	0,
+		.t	0.,	// 2*PI rad/s running timer
+		.ph	vector[],
+		.dph0	vector[],
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer.fd;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				if value
+					self.ta = self.vel;
+				else
+					self.ta = 0;
+			  }
+			  case VEL
+				self.vel = value;
+			  case PITCH
+				self.nphinc = self.ff_c0 * 2. ** value;
+			  case MOD
+				self.vib = value ** 2;
+			  case EXPR
+			  {
+				if value
+					self.d = SLOWDECAY;
+				else
+					self.d = FASTDECAY;
+			  }
+		}
+		function Process(self, frames)
+		{
+			if not self.out or (not self.a and not self.ta)
+				return false;
+/*			local vf = vector [];
+			local t = self.t;
+			self.t += self.ff_1 * frames;
+			local vs = self.voices;
+			for local j = 0, vs - 1
+			{
+				local w = j / vs;
+				local m = .08 * sin(t * 6 + w * 2);
+				local h = (sin(t * (.55 + w)) +
+					sin(t * (2.3 + w * 1.7))) * .004;
+				vf.+ (1 + m * self.vib + h) * self.phinc;
+			}
+			local low = self.a;
+			local dph0, local ph = self.(dph0, ph);
+			local out = self.out;
+			for local h = 0, self.oscillators - 1
+			{
+				local phinc = vf[h % vs];
+				add_polar_i(out, phinc * dph0[h] * FFTSIZE,
+						low / (h + 5), ph[h]);
+				ph[h] += dph0[h] * phinc * 2. * PI * frames;
+			}
+*/
+			local t = self.t;
+			local vs = self.voices;
+			local low = self.a;
+			local dph0, local ph = self.(dph0, ph);
+			local out = self.out;
+			for local j = 0, vs - 1
+			{
+				local w = j / vs;
+				local m = .08 * sin(t * 6 + w * 2);
+				local h = (sin(t * (.55 + w)) +
+					sin(t * (2.3 + w * 1.7))) * .004;
+				local vf = (1 + m * self.vib + h) * self.phinc;
+				local vf2pif = vf * 2. * PI * frames;
+				for local i = j, self.oscillators - 1, vs
+				{
+					add_polar_i(out, vf * dph0[i] * FFTSIZE,
+							low / (i + 5), ph[i]);
+					ph[i] += dph0[i] * vf2pif;
+				}
+			}
+			self.phinc += (self.nphinc - self.phinc) * GLISSANDO;
+			self.a += (self.ta - self.a) * self.d;
+			self.t += self.ff_1 * frames;
+			if self.a < 0.001
+			{
+				self.a = 0.;
+				return false;
+			}
+			else
+				return true;
+		}
+	];
+	for local j = 0, voices - 1
+	{
+		if voices > 1
+			local detune = .99 + .02 * j / (voices - 1);
+		else
+			detune = 0;
+		for local i = 1, oscillators / voices
+		{
+			local ind = (i - 1) * voices + j;
+			o.ph[ind] =  rnd(2 * PI);
+			o.dph0[ind] = base + (i - 1) * (.99 + rnd(.02)) * spread;
+			o.dph0[ind] *= detune;
+		}
+	}
+	return o;
+}
+
+function Strings(cfg)
+{
+	return PadSynth(cfg, 100, 5, 1, 1);
+}
+
+function Strings2(cfg)
+{
+	return PadSynth(cfg, 100, 10, 1, 1);
+}
+
+function ReedPad(cfg)
+{
+	return PadSynth(cfg, 100, 5, 1, .5);
+}
+
+function ReedPad2(cfg)
+{
+	return PadSynth(cfg, 100, 5, 2, .5);
+}
+
+function SquarePad(cfg)
+{
+	return PadSynth(cfg, 50, 5, 1, 2);
+}
+
+function TubularPad(cfg)
+{
+	return PadSynth(cfg, 50, 10, 1, 3);
+}
+
+function HollowPad(cfg)
+{
+	return PadSynth(cfg, 50, 10, 1, 1.5);
+}
+
+ 
+/*
+function Whistle
+{
+	constant FASTDECAY = .5;
+	constant SLOWDECAY = .1;
+	constant OSCILLATORS = 300;
+	local o = table [
+		.a	0,
+		.ta	0,
+		.d	FASTDECAY,
+		.nf	0,
+		.f	0,
+		.vib	0,
+		.ph	vector[],
+		.dph0	vector[],
+		procedure Note(self, v)
+		{
+			if v
+				self.ta = 1;
+			else
+				self.ta = 0;
+		}
+		procedure Switch(self, v)
+		{
+			if v
+				self.d = SLOWDECAY;
+			else
+				self.d = FASTDECAY;
+		}
+		procedure Frequency(self, f)
+		{
+			self.nf = f;
+		}
+		procedure Control(self, v)
+		{
+			self.vib = v ** 2;
+		}
+		procedure Process(self, fd)
+		{
+			local lfo = sin(SDL.GetTicks() * .011) * .02;
+			lfo += sin(SDL.GetTicks() * .017) * .05;
+			lfo += sin(SDL.GetTicks() * .04) * self.vib;
+			local f = self.f * (1 + lfo * .1);
+			self.ph.#+ self.dph0 #* (f * PI / FFT * WINDOW);
+			local low = self.a * .2;
+			local dph0, local ph = self.(dph0, ph);
+			dsp.c_add_polar_i(fd, f * dph0[0], 2 * low, ph[0]);
+			for local h = 1, OSCILLATORS - 1
+			{
+				local i = f * dph0[h];
+				local m = low / (h + 100);
+				dsp.c_add_polar_i(fd, i, m, ph[h]);
+			}
+			self.f += (self.nf - self.f) * .4;
+			self.a += (self.ta - self.a) * self.d;
+		}
+	];
+	for local i = 1, OSCILLATORS
+	{
+		o.ph.+ rnd(2 * PI);
+		o.dph0.+ 1 + i * .007 + rnd(.01) * (i - 1);
+	}
+	return o;
+}
+
+
+function Crash
+{
+	constant FASTDECAY = .95;
+	constant SLOWDECAY = .995;
+	constant OSCILLATORS = 2000;	// Number of oscillators
+	local o = table [
+		.a	0,		// Amplitude
+		.d	SLOWDECAY,	// Decay factor
+		.nf	0,		// Target frequency (bin)
+		.f	0,		// Current frequency (bin)
+		.ph	vector[],	// Oscillator phases
+		.dph0	vector[],	// Oscillator phase frequencies
+		procedure Note(self, v)
+		{
+			if v
+				self.a = 1;
+		}
+		procedure Switch(self, v)
+		{
+			if v
+				self.d = FASTDECAY;
+			else
+				self.d = SLOWDECAY;
+		}
+		procedure Frequency(self, f)
+		{
+			self.nf = f;
+		}
+		procedure Control(self, v)
+		{
+		}
+		procedure Process(self, fd)
+		{
+			// Update oscillator phase accumulators
+			self.ph.#+ self.dph0 #* (self.f * PI / FFT * WINDOW);
+
+			// Render oscillators in frequency space
+			local low = 3 * self.a ** 10;
+			if self.a == 1
+				local high = 7;
+			else
+				high = 30 * (1 - self.a) ** 1.5 * self.a ** 4;
+			local f, local dph0, local ph = self.(f, dph0, ph);
+			for local h = 0, OSCILLATORS - 1
+			{
+				// Calculate center FFT bin (fractional)
+				local i = f * dph0[h];
+
+				// Calculate magnitude
+				local m = low / (h + 30) + high / (h + 300);
+
+				// Add component
+				dsp.c_add_polar_i(fd, i, m, ph[h]);
+			}
+
+			// Update frequency and amplitude
+			self.f += (self.nf - self.f) * .5;
+			self.a *= self.d;
+		}
+	];
+	for local i = 1, OSCILLATORS
+	{
+		local w = (i - 1) / OSCILLATORS;
+		o.ph.+ rnd(2 * PI);
+		o.dph0.+ 1 + w * (15 + rnd(15));
+	}
+	return o;
+}
+
+
+function HiHat
+{
+	constant FASTDECAY = .93;
+	constant SLOWDECAY = .993;
+	constant OSCILLATORS = 300;
+	local o = table [
+		.a	0,
+		.d	SLOWDECAY,
+		.nf	0,
+		.f	0,
+		.ph	vector[],
+		.dph0	vector[],
+		procedure Note(self, v)
+		{
+			if v
+				self.a = 1;
+		}
+		procedure Switch(self, v)
+		{
+			if v
+				self.d = FASTDECAY;
+			else
+				self.d = SLOWDECAY;
+		}
+		procedure Frequency(self, f)
+		{
+			self.nf = f;
+		}
+		procedure Control(self, v)
+		{
+		}
+		procedure Process(self, fd)
+		{
+			self.ph.#+ self.dph0 #* (self.f * PI / FFT * WINDOW);
+			local low = 4 * self.a ** 7;
+			local f, local dph0, local ph = self.(f, dph0, ph);
+			for local h = 0, OSCILLATORS - 1
+			{
+				local i = f * dph0[h];
+				local m = low / (h + 50);
+				dsp.c_add_polar_i(fd, i, m, ph[h]);
+			}
+			self.f += (self.nf - self.f) * .5;
+			self.a *= self.d;
+		}
+	];
+	for local i = 1, OSCILLATORS
+	{
+		local w = (i - 1) / OSCILLATORS;
+		o.ph.+ rnd(2 * PI);
+		o.dph0.+ 1 + w * (4 + rnd(1));
+	}
+	return o;
+}
+*/
+
+
+export function Descriptor
+{
+	return table [
+		.Name		"FFTSynth",
+		.Author		"David Olofson",
+		.Copyright	"Copyright (C) 2006-2011 David Olofson",
+
+		// For now, the synth constructor is just a wrapper that
+		// forwards calls to the specific constructor for each preset.
+		function Create(cfg, preset)
+		{
+			return preset(cfg);
+		}
+		
+		.presets	table [
+			.Default	Sine,
+			.Sine		Sine,
+			.NBNoise	NBNoise,
+			.Flute		Flute,
+			.Flute2		Flute2,
+			.BLSaw		BLSaw,
+			.ResoSaw	ResoSaw,
+			.Bass		Bass,
+			.Strings	Strings,
+			.Strings2	Strings2,
+			.ReedPad	ReedPad,
+			.ReedPad2	ReedPad2,
+			.SquarePad	SquarePad,
+			.TubularPad	TubularPad,
+			.HollowPad	HollowPad
+		],
+		function ListPresets(self)
+		{
+			local names = [];
+			for local i = 0, sizeof self.presets - 1
+				names.+ key(self.presets, i);
+			return names;
+		}
+		function GetPreset(self, name)
+		{
+			return self.presets[name];
+		}
+
+		// Entry points for the FFT spectrum audio format
+		function CreateBuffer(cfg)
+		{
+			local b = table [
+// Reverb energy bins + filter
+//.rvb	vector [],
+//.rvbf	vector [],
+				// FFT spectrum; (FFTSIZE/2 + 1) <re, im> pairs.
+				.fd	vector [],
+				// Window for overlap/add
+				.win	vector [],
+				// Copy of last time domain output buffer
+				.td	vector []
+			];
+			b.fd[FFTSIZE + 2 - 1] = 0.;
+			b.td[FFTSIZE - 1] = 0.;
+			// Overlap-add window, padded to match FFT size.
+			// Using a Hann window here, to reduce the audible
+			// impact of inaccuracies in the synthesised partials.
+			local wsize = cfg.buffer * 2;
+			// Pre-window pad
+			if FFTSIZE > wsize
+				b.win[(FFTSIZE - wsize) / 2 - 1] = 0.;
+			for local i = 0, wsize / 2 - 1
+				b.win.+ .5 - cos(i * 2 * PI / wsize) * .5;
+			// "Mirror" by the rule "sum is always 1"
+			local i0 = sizeof b.win - wsize / 2;
+			for local i = 0, wsize / 2 - 1
+				b.win.+ 1. - b.win[i0 + i];
+			// Post-window pad
+			if FFTSIZE > wsize
+				b.win[FFTSIZE - 1] = 0.;
+/*b.rvb[FFTSIZE/2+1] = 0.;
+for local i = 0, sizeof b.rvb - 1
+	b.rvbf[i] = .998;
+b.rvbf[0] = .99;
+b.rvbf[1] = .995;*/
+			return b;
+		}
+		procedure ClearBuffer(buffer)
+		{
+			buffer.fd.#* 0;
+//buffer.rvb.#* .998;
+//buffer.rvb.#* buffer.rvbf;
+		}
+		procedure ConvertBuffer(buffer, output)
+		{
+			// Grab last output buffer
+			local last_td = buffer.td;
+/*
+// Get reverb input
+for local i = 0, FFTSIZE/2
+	buffer.rvb[i] += dsp.c_abs(buffer.fd, i) * .001;
+// Generate reverb output
+for local i = 1, FFTSIZE/2
+	dsp.c_add_polar(buffer.fd, i, buffer.rvb[i-1], rnd(2. * PI));
+*/
+			// IFFT!
+			buffer.td = dsp.ifft_real(buffer.fd);
+			// Apply window
+			local c = FFTSIZE / 2;
+			local wh = sizeof output;
+			buffer.td.#* buffer.win;
+			// Cut'n'paste
+			local out = copy(last_td, c, wh) #+
+					copy(buffer.td, c - wh, wh);
+			// Write output
+			output.#* 0.;
+			output.#+ out;
+		}
+	];
+}

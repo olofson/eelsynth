@@ -1,0 +1,759 @@
+//////////////////////////////////////////////////////
+// synth.eel - EELSynth main file
+// Copyright (C) 2007, 2010-2011 David Olofson
+//////////////////////////////////////////////////////
+
+import "synthapi" as S;
+import "plugins/fbdelay" as fbdelay;
+import "SDL" as SDL;
+import "midi" as midi;
+import "sequencer" as sequencer;
+import "maingui" as mg;
+import "ebgui" as ebgui;
+import "math";
+import "io" as io;
+import "dir" as dir;
+
+
+  ///////////////////////////////////////
+ // Constants
+///////////////////////////////////////
+
+// Channel controls
+constant VOL = 0;	// Channel mixdown volume ([1.0 <==> 0 dB])
+constant PAN = 1;	// Channel mixdown pan position ([-1, 1])
+constant PITCH = 2;	// Channel pitch offset (linear pitch)
+
+
+  ///////////////////////////////////////
+ // Configuration
+///////////////////////////////////////
+
+static config = table [
+	.fc0	S.DEFAULT_FC0,
+	.fs	44100,
+	.buffer	64
+];
+
+
+  ///////////////////////////////////////
+ // Synth plugin management
+///////////////////////////////////////
+
+function load_synths(plugindir, gui)
+{
+	local synths = table [];
+	local d = directory [plugindir];
+	while true
+	{
+		local n = d:read();
+		if not n
+			break;
+		n = plugindir + "/" + n;
+		try
+		{
+			local desc = load(n).Descriptor();
+			desc.__filename = n;
+			synths[desc.Name] = desc;
+		}
+		except
+			print("WARNING: Could not load plugin \"", n, "\"! (",
+					exception_name(exception), ")\n");
+	}
+	return synths;
+}
+
+
+// Make synths available through the GUI
+procedure present_synths(gui, synths)
+{
+	gui:RemoveSynths();
+	for local i = 0, sizeof synths - 1
+	{
+		local si = index(synths, i);
+		// Cache preset names (if any) and replace/add ListPresets()
+		try
+			si.__presets_cached = si:ListPresets();
+		except
+			si.__presets_cached = ["Default"];
+		si.ListPresets = function(self)
+			{
+				return self.__presets_cached;
+			};
+
+		// Build GUI selector with all presets
+		gui:AddSynth(si);
+	}
+}
+
+
+  ///////////////////////////////////////
+ // Polyphonic synth channel
+///////////////////////////////////////
+
+function Channel(ind, cfg, synths)
+{
+	local t = table [
+		.index		ind,	// Channel index
+		.config		cfg,	// System configuration
+		.synths		synths,	// Table of available synths
+
+		// MIDI bank select handling
+		.bank_msb	0,
+		.bank_lsb	0,
+
+		// Descriptor of selected synth
+		.synth_name	nil,	// Name of current synth
+		.descriptor	nil,	// Synth descriptor
+		.preset		nil,	// Synth preset
+		.preset_name	nil,
+
+		// Synth's channel shared state and processing
+		.chstate	nil,
+		.chprocess	nil,
+
+		// Polyphonic voice management
+		.voices		[],	// Array of synth instances
+		.dvoices	[],	// Array of detached voices
+
+		// Controls
+		.controls	vector [],	// Cache for voice controls
+		.pitch		vector [],	// Voice pitch cache
+		.ccontrols	vector [],	// Channel controls
+
+		// Custom audio formats
+		.aclear		nil,
+		.aconv		nil,
+
+		// Audio mixing
+		.lgain		1.,	// Channel output gain, left
+		.rgain		1.,	// Channel output gain, right
+		.mixbuf		nil,	// Voice mixdown buffer (any format!)
+		.outbuf		vector [],	// Channel output buffer
+
+		// 'preset' can be an index or a preset name string.
+		procedure Instrument(self, name)[preset]
+		{
+			local desc = self.synths[name];
+
+			// Find desired preset
+			local pn = "Default";
+			if specified preset
+			{
+				local pa = preset;
+				if typeof pa == string or
+						typeof pa == dstring
+					pn = pa;
+				else try
+					pn = desc:ListPresets()[pa];
+			}
+
+			// Don't reselect current instrument!
+			if self.synth_name == name and self.preset_name == pn
+				return;
+
+			// Load/create preset
+			self.preset = nil;
+			try self.preset = desc:GetPreset(pn);
+
+			// Clean up!
+			self.voices = [];
+			self.dvoices = [];
+
+			// Store "quick info" on the new instrument!
+			self.preset_name = pn;
+			self.descriptor = desc;
+			self.synth_name = name;
+
+			// Channel shared state and/or processing?
+			self.(chstate, chprocess) = nil;
+			try
+				self.chstate = desc:CreateSharedState(self.config);
+			try
+				self.chprocess = desc.SharedProcess;
+
+			// Custom audio format?
+			try
+			{
+				self.aclear = desc.ClearBuffer;
+				self.aconv = desc.ConvertBuffer;
+				self.mixbuf = desc.CreateBuffer(self.config);
+			}
+			except
+			{
+				// Standard format...
+				self.(aclear, aconv) = nil;
+				self.mixbuf = self.outbuf;
+			}
+		}
+
+		// Like the instrument Control() method, but this adds
+		// "virtual voice" addressing for polyphony. Each virtual
+		// voice addresses one instance of the instrument. An instance
+		// is created automatically whenever a voice is addressed the
+		// first time. Virtual voice ID -1 means "all voices".
+		procedure Control(self, vvoice, cport, value)
+		{
+			// Apply to all voices?
+			if vvoice == -1
+			{
+				// This is channel wide; cache for new voices!
+				self.controls[cport] = value;
+				// Control transforms
+				if cport == S.PITCH
+				{
+					self.pitch.#* 0.;
+					self.pitch.#+ value;
+					value += self.ccontrols[PITCH];
+				}
+				// Apply!
+				local vs = self.voices;
+				for local i = 0, sizeof vs - 1
+					if vs[i]
+						vs[i]:Control(cport, value);
+				vs = self.dvoices;
+				for local i = 0, sizeof vs - 1
+					vs[i]:Control(cport, value);
+				return;
+			}
+
+			// Instantiate new voices as needed!
+			local v = nil;
+			try
+				v = self.voices[vvoice];
+			if not v
+			{
+				// New voice!
+				v, self.voices[vvoice] = self.descriptor.
+						Create(self.(config, preset));
+				v:Connect(S.AOUTPUT, self.mixbuf);
+				if self.chstate
+					v:SetSharedState(self.chstate);
+
+				// Apply channel wide voice controls
+				local cc = self.controls;
+				for local i = 0, sizeof cc - 1
+					self:Control(vvoice, i, cc[i]);
+			}
+
+			// Control transforms
+			if cport == S.PITCH
+			{
+				self.pitch[vvoice] = value;
+				value += self.ccontrols[PITCH];
+			}
+
+			// Apply!
+			v:Control(cport, value);
+		}
+
+		// Detach the physical voice from the virtual voice. The voice
+		// will keep playing until finished (release envelopes etc), and
+		// will then be deleted. The virtual voice index will
+		// immediately be available to control a new physical voice.
+		// Virtual voice ID -1 means "all voices".
+		procedure Detach(self, vvoice)
+		{
+			local v = self.voices;
+			if vvoice == -1
+				local i0, local i1 = 0, sizeof v - 1;
+			else
+				i0, i1 = vvoice;
+			if vvoice >= sizeof v
+				return;
+			for local i = i0, i1
+			{
+				if not v[i]
+					return;
+				self.dvoices.+ v[i];
+				v[i] = nil;
+			}
+		}
+
+		// Channel controls.
+		procedure CControl(self, ccport, value)
+		{
+			local cc = self.ccontrols;
+			cc[ccport] = value;
+			switch ccport
+			  case VOL, PAN
+			  {
+				self.lgain = cc[VOL] * (.5 - cc[PAN] * .5);
+				self.rgain = cc[VOL] * (.5 + cc[PAN] * .5);
+			  }
+			  case PITCH
+			  {
+				local v = self.voices;
+				local p = self.pitch;
+				local chp = self.ccontrols[PITCH];
+				for local i = 0, sizeof v - 1
+					if v[i]
+						v[i]:Control(S.PITCH,
+								p[i] + chp);
+			  }
+		}
+
+		// Process all voices and then mix the result into the
+		// specified output buffers.
+		procedure Process(self, lbuf, rbuf, frames)
+		{
+			// Channel processing, if any
+			if self.chprocess
+				self.chprocess(self.chstate);
+
+			local v = self.voices;
+			if not sizeof v
+				return;		// No processing if silent!
+
+			// Clear mixing buffer
+			if self.aclear
+				self.aclear(self.mixbuf);
+			else
+				self.mixbuf.#* 0.;
+
+			// Process voices
+			for local i = 0, sizeof v - 1
+				if v[i]
+					v[i]:Process(frames);
+
+			// Process detached voices until they finish playing
+			v = self.dvoices;
+			for local i = sizeof v - 1, 0, -1
+				if not v[i]:Process(frames)
+					delete(v, i);
+
+			// Convert mixing buffer, if needed
+			if self.aconv
+				self.aconv(self.(mixbuf, outbuf));
+
+			// Process channel inserts
+			// TODO
+
+			// Master mixdown
+			lbuf.#+ self.outbuf #* self.lgain;
+			rbuf.#+ self.outbuf #* self.rgain;
+		}
+	];
+	t.outbuf[cfg.buffer - 1] = 0.;
+	t.ccontrols[VOL, PAN, PITCH] = 1., 0., 0.;
+	return t;
+}
+
+
+  ///////////////////////////////////////
+ // Main program
+///////////////////////////////////////
+
+export function main<args>
+{
+	// Open GUI
+	local bpp = 0;
+	local flags = SDL.SWSURFACE | SDL.RESIZABLE;
+	local screen = SDL.SetVideoMode(800, 600, bpp, flags);
+	SDL.SetCaption("EELSynth 0.1", args[0]);
+	SDL.EnableKeyRepeat(250, 30);
+
+	// Open audio I/O
+	if sizeof args >= 2
+		config.buffer = (integer)args[1];
+	if sizeof args >= 3
+		local abuf = (integer)args[2];
+	else
+		abuf = config.buffer * 2;
+	SDL.OpenAudio(config.fs, abuf, abuf * 2);
+
+	// Open GUI
+	local gui = mg.Open(screen);
+	
+	// Open MIDI I/O
+	local usingmidi = false;
+	try
+	{
+		midi.OpenMIDI();
+		usingmidi = true;
+	}
+
+	// Load synth plugins
+	local synths = load_synths("plugins", gui);
+	present_synths(gui, synths);
+
+	// Open sequencer
+	local seq = sequencer.New();
+	seq.seltrack = 0;
+	seq.efilter[sequencer.EV_INSTRUMENT, sequencer.EV_CCONTROL] = true;
+//	seq.cfilter[S.MOD, S.EXPR, S.DEPTH, S.CUTOFF] = true;
+	seq.loop = seq.measure * 4;
+	seq.tempo = 800;
+
+	// Set up channels and sequencer tracks
+	local channels = [];
+	local tracks = [];
+	for local i = 0, 15
+	{
+		local ch = Channel(i, config, synths);
+		channels.+ ch;
+		ch:Instrument(key(synths, 0));
+		ch:CControl(VOL, .3);
+		local tr = seq:AddTrack();
+		tr:Connect(ch);
+		tracks.+ tr;
+	}
+
+	// Set up output routing
+	local lmix = vector [];
+	lmix[config.buffer - 1] = 0.;
+	local rmix = clone lmix;
+
+	local delay = fbdelay.Descriptor().Create(config, table [
+			.LeftDelay	.271,
+			.RightDelay	.331,
+			.Feedback	.5,
+			.CrossFeedback	.2,
+			.Level		.3
+		]);
+	S.ConnectMany(delay,
+			S.ALEFTINPUT, lmix,
+			S.ARIGHTINPUT, rmix,
+			S.ALEFTOUTPUT, lmix,
+			S.ARIGHTOUTPUT, rmix);
+
+	ebgui.Subscribe("reset", procedure(d, args) {
+		local s = load_synths("plugins", d.gui);
+		for local i = 0, sizeof d.channels - 1
+		{
+			local ch = d.channels[i];
+			ch.synths = s;
+			local n = ch.synth_name;
+			ch.synth_name = nil;
+			ch:Instrument(n, ch.preset_name);
+		}
+	}, table [
+		.channels	channels,
+		.gui		gui
+	]);
+
+	// Message handler for GUI instrument selection
+	ebgui.Subscribe("instrument", procedure(s, args) {
+		s.tracks[s.seltrack]:Instrument(args.(name, preset));
+	}, seq);
+
+	// Message handler for sequencer panel
+	ebgui.Subscribe("seq_track", procedure(s, arg) {
+		s.seltrack = arg;
+	}, seq);
+	ebgui.Subscribe("seq_mute", procedure(s, args) {
+		s.tracks[args[0]].play = not args[1];
+		if args[1]
+			s.tracks[args[0]]:StopAllNotes();
+	}, seq);
+	ebgui.Subscribe("seq_erase", procedure(s, args) {
+		s.tracks[s.seltrack]:Delete();
+	}, seq);
+	ebgui.Subscribe("seq_quantize", procedure(s, quant) {
+		s.quantize = quant;
+	}, seq);
+	ebgui.Subscribe("seq_metro", procedure(s, per) {
+		s.metro = per;
+	}, seq);
+	ebgui.Subscribe("seq_record", procedure(s, rec) {
+		s.record = rec;
+	}, seq);
+	ebgui.Subscribe("seq_play", procedure(s, play) {
+		s.play = play;
+		if not play
+			s:StopAllNotes();
+	}, seq);
+	ebgui.Subscribe("seq_rewind", procedure(s, arg) {
+		s:StopAllNotes();
+		s:Skip(0);
+////////////////////////////////////////////////////////
+//		s.songpos = 0;
+//		s:SongStep();
+////////////////////////////////////////////////////////
+	}, seq);
+	ebgui.Subscribe("seq_save", procedure(s, arg) {
+		try
+			io.write(file ["song.ess", "wb"], s:Serialize());
+		except
+			print("ERROR: Could not save song! (",
+					exception_name(exception), ")\n");
+	}, seq);
+	ebgui.Subscribe("seq_load", procedure(s, arg) {
+		try
+		{
+			local f = file ["song.ess", "rb"];
+			for local i = 0, sizeof s.tracks - 1
+				s.tracks[i]:Delete();
+			s:Deserialize(io.read(f, sizeof f));
+			s:StopAllNotes();
+			s:Skip(0);
+		}
+		except
+			print("ERROR: Could not load song! (",
+					exception_name(exception), ")\n");
+	}, seq);
+
+
+	local tm2 = nil;
+	local ld = 0.;
+	local metro = 0.;
+	local midiact = 0.;
+	while gui.running
+	mainloop:
+	{
+		// Handle MIDI events
+		while usingmidi
+		{
+			local ev = midi.ReadMIDI();
+			if not ev
+				break;
+			midiact = 1.;
+			// Record to the selected track, rather than ev.channel.
+			local tr = tracks[seq.seltrack];
+			switch ev.type
+			  case midi.NOTEON
+			  {
+				local p = ev.pitch;
+				if ev.velocity
+				{
+					tr:Control(p, S.PITCH, (p - 60) / 12.);
+					tr:Control(p, S.VEL, ev.velocity / 127.);
+					tr:Control(p, S.GATE, 1.);
+				}
+				else
+				{
+					tr:Control(p, S.GATE, 0.);
+					tr:Detach(p);
+				}
+			  }
+			  case midi.NOTEOFF
+			  {
+				local p = ev.pitch;
+				tr:Control(p, S.GATE, 0.);
+				tr:Detach(p);
+			  }
+			  case midi.CONTROLCHANGE
+			  {
+				local v = ev.value / 127.;
+				switch ev.control
+				  case 0
+					tr.bank_msb = ev.value;
+				  case 32
+					tr.bank_lsb = ev.value;
+				  case 1
+					tr:Control(-1, S.MOD, v);
+				  case 64
+					tr:Control(-1, S.EXPR, v);
+			  }
+			  case midi.PITCHBEND
+				tr:CControl(PITCH, ev.value / 8192.);
+			  case midi.PROGRAMCHANGE
+				try
+					tr:Instrument(key(synths, tr.bank_lsb),
+							ev.program);
+		}
+
+		// Handle SDL input events
+		while true
+		{
+			local ev = SDL.PollEvent();
+			if not ev
+				break;
+			switch ev.type
+			  case SDL.QUIT
+				ebgui.Send("request quit");
+			  case SDL.VIDEORESIZE
+			  {
+				screen = SDL.SetVideoMode(ev.w, ev.h,
+						bpp, flags);
+				ebgui.SetTarget(screen);
+				gui:Resize(ev.(w, h));
+			  }
+			  default
+				gui:Dispatch(ev);
+		}
+
+		// Try to minimize CPU abuse. (Non-blocking I/O...)
+		if SDL.AudioSpace() < config.buffer
+			SDL.Delay(1);
+
+		// Process!!!
+		local t0 = SDL.GetTicks();
+		local bcycles = 0;
+		local limit = (integer)(SDL.AudioSpace() / config.buffer * 2);
+		while SDL.AudioSpace() >= config.buffer
+		{
+			// Play sequenced events!
+			seq:Process(config.buffer / config.fs);
+			ebgui.Send("seq_time", seq);
+
+			// Metronome!
+			if seq.metrotick
+				metro = 3. - seq.metrotick * 2.;
+
+			// Clear master buffer
+			(lmix, rmix).#* 0.;
+
+			// Process channels
+			for local i = 0, sizeof channels - 1
+				channels[i]:Process(lmix, rmix, config.buffer);
+
+			// Master effects
+			delay:Process(config.buffer);
+
+			// Metronome
+			if metro > 0
+			{
+				local dm = 50. / config.fs;
+				for local i = 0, sizeof lmix - 1
+				{
+					lmix[i] += sin((1 - metro) * 400.) *
+							metro * .2;
+					metro -= dm;
+					metro >|= 0.;
+				}
+			}
+			else if metro < 0
+			{
+				local dm = 50. / config.fs;
+				for local i = 0, sizeof lmix - 1
+				{
+					lmix[i] += sin((1 + metro) * 600.) *
+							metro * -.3;
+					metro += dm;
+					metro |<= 0.;
+				}
+			}
+
+			// Output audio!
+			SDL.PlayAudio(lmix, rmix);
+			bcycles += 1;
+
+			// Feed audio to GUI
+			ebgui.Send("audio buffer", [lmix, rmix]);
+
+			// CPU overload protection
+			limit -= 1;
+			if not limit
+				break;
+		}
+		if bcycles
+		{
+			local t1 = SDL.GetTicks();
+			if t0 - tm2
+			{
+				local wgt = bcycles * .01;
+				ld = ld * (1. - wgt) +
+						wgt * (t1 - t0) / (t0 - tm2);
+				ebgui.Send("cpu load", ld);
+			}
+			tm2 = t0;
+		}
+
+		midiact *= .95 ** bcycles;
+		ebgui.Send("midi activity", midiact);
+
+		gui:Refresh();
+	}
+
+	if usingmidi
+		midi.CloseMIDI();
+	SDL.CloseAudio();
+	gui:Close();
+	return 0;
+}
+
+
+
+
+
+
+
+
+/*
+	import "math";
+	local ln2 = log(2);
+	for local i = 0, 15
+		channels[i]:CControl(VOL, .1);
+	for local i = 0, 10
+	{
+		local p = ev.pitch + i;
+		if ev.velocity
+		{
+			ch:Control(p, S.PITCH,
+					(ev.pitch - 60) / 12. +
+					log(i + 1)/ln2 + i * .001);
+			ch:Control(p, S.VEL,
+					ev.velocity / 127. /
+					(i + 1));
+			ch:Control(p, S.GATE, 1.);
+		}
+		else
+		{
+			ch:Control(p, S.GATE, 0.);
+			ch:Detach(p);
+		}
+	}
+*/
+/*
+TODO: Turn this into a mouse capture "mouse play" mode!
+		// Control state for GUI control
+		.guipitch	0.,
+		.guimod		0.,
+		.guivel		1.,
+		.guigate	0.,
+		while true
+		{
+			local ch = channels[0];
+			local ev = SDL.PollEvent();
+			procedure initctl
+			{
+				upvalue ch;
+				ch:Control(0, S.PITCH, upvalue guipitch);
+				ch:Control(0, S.MOD, upvalue guimod);
+				ch:Control(0, S.VEL, upvalue guivel);
+				ch:Control(0, S.GATE, upvalue guigate);
+			}
+			if not ev
+				break;
+			switch ev.type
+			  case SDL.KEYDOWN
+				if ev.sym >= SDL.KF1 and ev.sym <= SDL.KF12 try
+				{
+					ch:SetInstrument(synths[ev.sym - SDL.KF1]);
+					initctl();
+				}
+			  case SDL.KEYUP
+				if ev.sym == SDL.KESCAPE
+					break mainloop;
+			  case SDL.MOUSEBUTTONDOWN
+			  {
+				guivel = 1.;
+				guigate = 1.;
+				initctl();
+			  }
+			  case SDL.MOUSEBUTTONUP
+			  {
+				ch:Control(0, S.GATE, 0.);
+				guigate = 0.;
+				if ev.button == SDL.BUTTON_RIGHT
+					ch:Detach(0);
+			  }
+			  case SDL.MOUSEMOTION
+			  {
+				local p = 9. * ev.x / screen.w - 4.;
+				local m = 1. - ev.y / screen.h;
+				ch:Control(0, S.PITCH, p);
+				guipitch = p;
+				ch:Control(0, S.MOD, m);
+				guimod = m;
+			  }
+			  case SDL.VIDEORESIZE
+			  {
+				screen = SDL.SetVideoMode(ev.w, ev.h, bpp, flags);
+				gui:Resize(ev.(w, h));
+			  }
+			  case SDL.QUIT
+				break mainloop;
+		}
+*/

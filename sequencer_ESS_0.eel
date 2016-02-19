@@ -1,0 +1,64 @@
+////////////////////////////////////////////////////////////////////////
+// sequencer_ESS_0.eel - Header for loading ESS 0 format EELSynth songs
+// Copyright (C) 2010 David Olofson
+////////////////////////////////////////////////////////////////////////
+
+import "sequencer" as seq;
+
+export procedure Process(sequencer)
+{
+	local track = sequencer.tracks[0];
+	procedure Generator(s)
+	{
+		print("Generator: ", s, "\n");
+	}
+	procedure Format(f, v)
+	{
+		print("Format: ", f, ", version ", (string)v, "\n");
+		if f != "ESS"
+			print("WARNING: This is not an EES file!\n");
+		if v != 0
+			print("WARNING: File format version is not 0!\n");
+	}
+	procedure Tempo(t)
+	{
+		upvalue sequencer.tempo = t;
+	}
+	procedure TimeSig(b, m)
+	{
+		upvalue sequencer.(beat, measure) = b, m;
+	}
+	procedure Loop(s, l)
+	{
+		upvalue sequencer.(start, loop) = s, l;
+	}
+
+	procedure Track(t)
+	{
+		upvalue track = upvalue sequencer.tracks[t];
+	}
+
+	procedure IC<p, v>
+	{
+		for local i = 0, tuples - 1
+			upvalue track.icontrols[p[i]] = v[i];
+	}
+
+	procedure C(t, vv, p, v)
+	{
+		upvalue track:Insert([t, seq.EV_CONTROL, vv, p, v]);
+	}
+	procedure D(t, vv)
+	{
+		upvalue track:Insert([t, seq.EV_DETACH, vv]);
+	}
+	procedure I(t, i, p)
+	{
+		upvalue track:Insert([t, seq.EV_INSTRUMENT, i, p]);
+	}
+	procedure CC(t, p, v)
+	{
+		upvalue track:Insert([t, seq.EV_CCONTROL, p, v]);
+	}
+
+// Append ESS 0 serialized song here, and then a "}" after that!

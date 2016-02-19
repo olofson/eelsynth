@@ -1,0 +1,434 @@
+//////////////////////////////////////////////////////
+// synth.eel - EELSynth main file
+// Copyright (C) 2007, 2010 David Olofson
+//////////////////////////////////////////////////////
+
+import "SDL" as SDL;
+import "ebgui" as ebgui;
+import "math";
+
+
+function Oscilloscope(parent)
+{
+	constant PEAKFADE = 1.;
+	local p = ebgui.Panel(parent, "dent");
+	local c, p.canvas = ebgui.Panel(p, "flat");
+	p.Feed = procedure(self, data)
+	{
+		self.canvas.data = data;
+		self.canvas:Invalidate();
+	};
+	c.data = nil;
+	c.peaktime = SDL.GetTicks();
+	c.pen = SDL.MapColor(ebgui.GetTarget(), 0, 255, 0);
+	c.Redraw = procedure(self)
+	{
+		local tg = ebgui.GetTarget();
+		local d = self.data;
+		local r = self.rect;
+		if not d
+		{
+			self.theme:PassiveBar(r);
+			return;
+		}
+		local peak = 0.;
+		for local i = 0, sizeof d - 1
+			peak >|= abs(d[i]);
+		if peak >= 1.
+			self.peaktime = SDL.GetTicks();
+		local f = (1. - (SDL.GetTicks() - self.peaktime) * .001 /
+				PEAKFADE) >| 0.;
+		SDL.FillRect(tg, nil, SDL.MapColor(tg, f * 255, 32, 0));
+		local x0, local y0 = r.(x, y);
+		local xs = sizeof d / r.w;
+		local ys = r.h;
+		local pen = self.pen;
+		for local x = 0, r.w - 1
+			SDL.Plot(tg, pen, x0 + x,
+					y0 + (.5 - d[xs * x] * .5) * ys + .5);
+	};
+	return p;
+}
+
+
+function VUMeter(parent)
+{
+	local p = ebgui.Panel(parent, "dent");
+	local c, p.canvas = ebgui.Panel(p, "flat");
+	p.Feed = procedure(self, data)
+	{
+		local peak = 0.;
+		for local i = 0, sizeof data - 1
+			peak >|= abs(data[i]);
+		self.canvas.peak = peak;
+		self.canvas:Invalidate();
+	};
+	c.peak = 0.;
+	c.paper = SDL.MapColor(ebgui.GetTarget(), 0, 0, 0);
+	c.Redraw = procedure(self)
+	{
+		local tg = ebgui.GetTarget();
+		SDL.FillRect(tg, nil, self.paper);
+		local r = clone self.rect;
+		local peak = 0. >| self.peak |< 1.;
+		local h = (integer)(r.h * peak + .5);
+		r.y += r.h - h;
+		r.h = h;
+		SDL.FillRect(tg, r, SDL.MapColor(tg, 255, 0, 0));
+	};
+	return p;
+}
+
+	
+export function Open(screen)
+{
+	local t = table [
+		.running	true,
+		.gui		nil,
+
+		procedure Close(self)
+		{
+			ebgui.Unsubscribe();
+			ebgui.Close();
+		}
+
+		procedure Dispatch(self, ev)
+		{
+//local t0 = SDL.GetTicks();
+			switch ev.type
+			  case SDL.VIDEOEXPOSE
+				ebgui.Invalidate();
+			  default
+				ebgui.Dispatch(ev);
+//local t1 = SDL.GetTicks() - t0;
+//if t1
+//	print("Dispatch(): ", t1, " ms\n");
+		}
+
+		procedure Resize(self, w, h)
+		{
+			self.gui:SetPosition(SDL.Rect [0, 0, w, h]);
+			ebgui.Invalidate();
+		}
+
+		.askquit_up	false,
+		procedure AskQuit(self, args)
+		{
+			if self.askquit_up
+				return;
+			local r = SDL.Rect [0, 0, 200, 100];
+			r.(x, y) = (ebgui.GetTarget().(w, h) - r.(w,h)) / 2;
+			local win = ebgui.Window(r);
+			win.gui = self;
+			win:ApplyTheme(self.alerttheme);
+			win:SetAlign("grid", 1, 3, nil, vector [2, 7, 3]);
+			ebgui.DragBar(win);
+			ebgui.Label(win, "Really quit?");
+			local p = ebgui.Panel(win, "none");
+			p:SetAlign("grid", 2, 1);
+			ebgui.Button(p, "Yes", procedure(s) {
+				ebgui.Send("quit application");
+			});
+			local b = ebgui.Button(p, "No", procedure(s)
+			{
+				s.root.gui.askquit_up = false;
+				s.win:Delete();
+			});
+			b.win = win;
+			ebgui.SetModal(win);
+			ebgui.SetFocus(b);
+			self.askquit_up = true;
+		}
+
+		procedure Refresh(self)
+		{
+			local dr = array [];
+			ebgui.Refresh(dr);
+/*
+local tgt = ebgui.GetTarget();
+SDL.SetClipRect(tgt);
+for local i = 0, sizeof dr - 1
+{
+	procedure box(target, rect, color)
+	{
+		local r = clone rect;
+		// Top and bottom
+		r.h = 1;
+		SDL.FillRect(target, clone r, color);
+		r.y += rect.h - 1;
+		SDL.FillRect(target, clone r, color);
+
+		// Left and right
+		r.(y, w, h) = rect.y + 1, 1, rect.h - 2;
+		SDL.FillRect(target, clone r, color);
+		r.x += rect.w - 1;
+		SDL.FillRect(target, r, color);
+	}
+	box(tgt, dr[i], SDL.MapColor(tgt, SDL.GetTicks() & 255, 0, 128));
+}
+*/
+			if sizeof dr
+				SDL.Update(dr);
+		}
+
+		.sx	10,
+		.synths	[],
+		procedure AddSynth(self, desc)
+		{
+print("Adding ", desc.Name, " by ", desc.Author, ", ", desc.Copyright, "\n");
+			local m = ebgui.Popup(self.gui, SDL.Rect [
+					self.sx, 50, 100, 100]):
+					SetAlign("stretch", 1);
+			self.sx += 110;
+			self.synths[sizeof self.synths] (=) m;
+			ebgui.DragBar(m, desc.Name):SetSize(100, 16);
+			ebgui.Label(m, "Presets:"):SetSize(100, 16);
+			local s = ebgui.Selector(m, "command",
+					procedure(slf, value) {
+				ebgui.Send("instrument", table [
+						.name	slf.name,
+						.preset	value
+					]);
+			});
+			s.name = desc.Name;
+			local presets = ["Default"];
+			try
+				presets = desc:ListPresets();
+			for local i = 0, sizeof presets - 1
+			{
+print("  Preset ", i, ": ", presets[i], "\n");
+				s:AddItems(presets[i], presets[i]);
+			}
+			s:SetSize(100, sizeof s.widgets * 12 + 2);
+//			m:AutoSize(100, 16);
+		}
+		procedure RemoveSynths(self)
+		{
+			for local i = 0, sizeof self.synths - 1
+				self.synths[i]:Delete();
+			delete(self.synths);
+			self.sx = 10;
+		}
+	];
+
+	// Set up GUI themes
+	local th, t.maintheme = ebgui.DefaultTheme();
+	th:SetActiveColors(40, 80, 160, 1.7);
+	th:SetPassiveColors(24, 48, 96, 1.0);
+	th:SetMarkColor(255, 192, 0);
+
+	th, t.alerttheme = ebgui.DefaultTheme();
+	th:SetActiveColors(160, 120, 60, 1.7);
+	th:SetPassiveColors(96, 64, 32, 1.0);
+	th:SetMarkColor(255, 192, 0);
+
+	// Initialize EBGUI
+	ebgui.Open(screen, t.maintheme);
+
+	// Create main GUI
+	local root, t.gui = ebgui.Root();
+	root.gui = t;
+	root.colrowratio = 0;
+	root.rowratio = vector [2, 24];
+	local tb = ebgui.Panel(root, "thin")
+		:SetAlign("grid", 4, 1, vector [9, 3, 3, 1]);
+	tb.colrowratio = 1000;
+
+	// (unused)
+	ebgui.Panel(tb, "flat");
+
+	// CPU load meter, MIDI status etc
+	local p = ebgui.Panel(tb)
+		:SetAlign("grid", 1, 2);
+	p.colrowratio = 0;
+	t.cpumeter = ebgui.ProgressBar(p);
+	t.midimeter = ebgui.ProgressBar(p);
+	t.cpumeter:Set(.1);
+	t.midimeter:Set(0);
+
+	// Master output monitor
+	p = ebgui.Panel(tb)
+		:SetAlign("grid", 4, 1, vector [5, 1, 5, 1]);
+	p.colrowratio = 1000;
+	t.leftosc = Oscilloscope(p);
+	t.leftvu = VUMeter(p);
+	t.rightosc = Oscilloscope(p);
+	t.rightvu = VUMeter(p);
+	ebgui.Subscribe("audio buffer", procedure(gui, args) {
+		gui.leftosc:Feed(args[0]);
+		gui.leftvu:Feed(args[0]);
+		gui.rightosc:Feed(args[1]);
+		gui.rightvu:Feed(args[1]);
+	}, t);
+
+	// RESET/QUIT
+	p = ebgui.Panel(tb):SetAlign("grid", 1, 2);
+	ebgui.Button(p, "QUIT", procedure(self) {
+		ebgui.Send("request quit");
+	});
+	ebgui.Button(p, "RESET", procedure(self) {
+		ebgui.Send("reset");
+	});
+
+	// Main workspace
+	local ws = ebgui.Panel(root, "flat");
+
+	// Set up "global" message handlers
+	ebgui.Subscribe("request quit", t.AskQuit, t);
+	ebgui.Subscribe("quit application", procedure(gui, args) {
+		gui.running = false;
+	}, t);
+	ebgui.Subscribe("cpu load", procedure(gui, ld) {
+		gui.cpumeter:Set(ld);
+	}, t);
+	ebgui.Subscribe("midi activity", procedure(gui, ld) {
+		gui.midimeter:Set(ld);
+	}, t);
+
+	// Sequencer control panel
+	local sq = ebgui.Popup(t.gui, SDL.Rect [180, 180, 600, 400]):
+			SetAlign("grid", 1, 3, nil, vector [1, 20, 1]);
+	    // Drag bar
+	    ebgui.DragBar(sq, "Sequencer");
+
+	    // Main panel
+	    local seqfw = ebgui.Panel(sq, "flat"):
+				SetAlign("grid", 4, 1, vector [5, 20, 1, 2]);
+
+		// Left sidebar
+		p = ebgui.Panel(seqfw):SetAlign("grid", 1, 11, nil,
+				vector [2,		// Shuttle control
+					.5, 1, .5,	// Track operations
+					.8, 8,		// Quantization
+					.8, 8,		// Metronome
+					.5, 1, 1]);	// File I/O
+			local s = ebgui.Panel(p):SetAlign("grid", 3, 1);
+				ebgui.Button(s, "|<", procedure(self) {
+					ebgui.Send("seq_rewind");
+				});
+				ebgui.Toggle(s, ">", procedure(self) {
+					ebgui.Send("seq_play", self.state);
+				});
+				ebgui.Toggle(s, "REC", procedure(self) {
+					ebgui.Send("seq_record", self.state);
+				});
+
+			ebgui.Panel(p, "flat");
+			ebgui.Button(p, "ERASE", procedure(self) {
+				ebgui.Send("seq_erase");
+			});
+			ebgui.Panel(p, "flat");
+
+			ebgui.Label(p, "Quantize");
+			s = ebgui.Selector(p, "radio",
+				procedure(slf, value) {
+				ebgui.Send("seq_quantize", value);
+			});
+			s:AddItems("OFF", 0);
+			s:AddItems("32nd", 60);
+			s:AddItems("16th Triplet", 80);
+			s:AddItems("16th", 120);
+			s:AddItems("8th Triplet", 160);
+			s:AddItems("8th", 240);
+			s:AddItems("Quarter", 480);
+			s:AddItems("Half", 960);
+
+			ebgui.Label(p, "Metronome");
+			s = ebgui.Selector(p, "radio",
+				procedure(slf, value) {
+				ebgui.Send("seq_metro", value);
+			});
+			s:AddItems("OFF", 0);
+			s:AddItems("32nd", 60);
+			s:AddItems("16th Triplet", 80);
+			s:AddItems("16th", 120);
+			s:AddItems("8th Triplet", 160);
+			s:AddItems("8th", 240);
+			s:AddItems("Quarter", 480);
+			s:AddItems("Half", 960);
+
+			ebgui.Panel(p, "flat");
+
+			ebgui.Button(p, "SAVE", procedure(self) {
+				ebgui.Send("seq_save");
+			});
+			ebgui.Button(p, "LOAD", procedure(self) {
+				ebgui.Send("seq_load");
+			});
+
+		// Edit view
+		p = ebgui.Panel(seqfw);
+			ebgui.Label(p, "<Editors go here>");
+
+		// Mute bar
+		p = ebgui.Panel(seqfw):SetAlign("grid", 1, 2, nil,
+				vector [1, 16]);
+			ebgui.Label(p, "M");
+			s = ebgui.Selector(p, "toggle",
+				procedure(slf, value, state) {
+				ebgui.Send("seq_mute", [value, state]);
+			});
+			for local i = 0, 15
+				s:AddItems("", i);
+
+		// Right sidebar (track selector)
+		p = ebgui.Panel(seqfw):SetAlign("grid", 1, 2, nil,
+				vector [1, 16]);
+			ebgui.Label(p, "Trk");
+			s = ebgui.Selector(p, "radio",
+				procedure(slf, value) {
+				ebgui.Send("seq_track", value);
+			});
+			for local i = 0, 15
+				s:AddItems((string)i, i);
+
+	    // Bottom bar
+	    p = ebgui.Panel(sq):SetAlign("grid", 3, 1, vector [5, 20, 3]);
+	    		s = ebgui.Label(p, "");
+			ebgui.Subscribe("seq_time", procedure(lab, seq) {
+				lab:SetCaption(seq:Pulses2BBP(seq.now));
+			}, s);
+
+/*
+for local i = 0, 10
+{
+	local m, t.testmenu = ebgui.Popup(ws, SDL.Rect [
+			20 + 20 * i, 20 + 10 * i]);
+	ebgui.DragBar(m, "Test Menu");
+	ebgui.Label(m, "Commands:");
+	ebgui.Selector(m, "command", procedure(self, value) {
+		print("command ", value, "\n");
+	}):AddItems(
+			"Item One",	1,
+			"Item Two",	2,
+			"Item Three",	3,
+			"Item Four",	4,
+			"Item Five",	5,
+			"Item Six",	6,
+			"Item Seven",	7,
+			"Item Eight",	8
+		);
+	ebgui.Label(m, "Radio items:");
+	ebgui.Selector(m, "radio", procedure(self, value) {
+		print("radio ", value, "\n");
+	}):AddItemsState(
+			"Radio One",	"one",	false,
+			"Radio Two",	"two",	true,
+			"Radio Three",	"three",false,
+			"Radio Four",	"four",	false
+		);
+	ebgui.Label(m, "Toggle items:");
+	ebgui.Selector(m, "toggle", procedure(self, value, state) {
+		print("toggle ", value, " changed to ", state, "\n");
+	}):AddItemsState(
+			"Toggle One",	"I",	false,
+			"Toggle Two",	"II",	true,
+			"Toggle Three",	"III",	false,
+			"Toggle Four",	"IV",	true
+		);
+	m:AutoSize(100, 16);
+}
+*/
+
+	return t;
+}

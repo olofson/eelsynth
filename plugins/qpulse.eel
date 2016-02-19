@@ -1,0 +1,145 @@
+//////////////////////////////////////////////////////
+// qpulse.eel - Quantized Pulse synth
+// Copyright (C) 2010 David Olofson
+//////////////////////////////////////////////////////
+
+module qpulse;
+
+import "synthapi";
+import "math";
+
+
+static presets = table [
+	.Default	table [
+		.ratio		.5,
+		.decay		0.,
+		.release	44.1
+	],
+	.Organ		table [
+		.ratio		.3,
+		.decay		0.,
+		.release	44.1
+	],
+	.Piano		table [
+		.ratio		.1,
+		.decay		2.2,
+		.release	2.2
+	]
+];
+
+
+function Create(cfg, preset)
+{
+	local t = table [
+		.out		nil,
+		.gate		0.,
+		.vel		0.,
+		.pf		cfg.fs / cfg.fc0,	// C0, period
+		.ff_1		2. * PI / cfg.fs,	// 1 Hz
+		.period		1,	// # of samples per period
+		.ph		0,	// Current phase (samples)
+		.amp		0.,
+		.decay		preset.decay / cfg.fs,
+		.release	preset.release / cfg.fs,
+		.vib		0.,	// Vibrato depth
+		.mod		0.,	// Phasing depth
+		.lfo_ph		0.,	// Vibrato LFO phase
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					// Latch velocity and reset phase!
+					self.amp = self.vel;
+					self.ph = 0.;
+				}
+			  }
+			  case VEL
+				self.vel = value;
+			  case MOD
+				self.mod = value;
+			  case PITCH
+			  {
+				self.period = self.pf / 2. ** value;
+				self.modscale = .5 + (0. >| value * .2 |< .5);
+			  }
+		}
+		function Process(self, frames)
+		{
+			if not self.out or not self.amp
+				return false;
+			local out, local amp = self.(out, amp);
+			local damp = 0.;
+			local running = true;
+			if amp < .0001
+				damp = -self.vel * .0001;
+			else
+			{
+				if self.gate
+					damp = -amp * self.decay;
+				else
+					damp = -self.vel * self.release;
+			}
+			if -damp * frames >= amp
+			{
+				// Too short! Fit it to one fragment.
+				damp = -amp / frames;
+				// We're done after this fragment!
+				self.amp = 0.;
+				running = false;
+			}
+			local lfo = sin(self.lfo_ph);
+			self.lfo_ph += self.ff_1 * frames;
+			local pw = .5 + self.mod * self.modscale * lfo * .45;
+			local ph = self.ph;
+			local period = self.period + lfo * self.vib;
+			local width = 1. + (period - 2.) * pw;
+			local up = (period - width) / 2;
+			local down = up + width;
+			period = (integer)(period + .5);
+			up = (integer)(up + .5);
+			down = (integer)(down + .5);
+			local bias = -amp;
+			for local s = 0, frames - 1
+			{
+				ph = (ph + 1) % period;
+				out[s] += bias + amp * (ph >= up and ph < down);
+				amp += damp;
+			}
+			self.(ph, amp) = ph, amp;
+			return running;
+		}
+	];
+	return t;
+}
+
+
+export function Descriptor
+{
+	return table [
+		.Name		"QPulse",
+		.Author		"David Olofson",
+		.Copyright	"Copyright (C) 2010 David Olofson",
+		.Create		Create,
+		function ListPresets(self)
+		{
+			local names = [];
+			for local i = 0, sizeof presets - 1
+				names.+ key(presets, i);
+			return names;
+		}
+		function GetPreset(self, name)
+		{
+			return presets[name];
+		}
+	];
+}

@@ -1,0 +1,236 @@
+
+                        EELSynth
+----------------------------------------------------------
+        Polyphonic Synthesizer Prototyping Testbed
+          Copyright (C) 2007-2011  David Olofson
+
+   This is a realtime synthesizer prototyping framework
+   written in EEL. It supports MIDI, mouse and keyboard
+   input,  is  multitimbral and  polyphonic,  and loads
+   synthesizer plugins in the form of EEL modules.
+
+
+TODO
+	* Minimal file selector! (EBGUI)
+	* Perlin morph oscillator synth!!!
+	* Sequencer:
+		* Song!!! (Schedule tracks for each loop for now.)
+			Later on:
+				* A track can be a clip/pattern that is
+				  not played directly.
+				* Add an event that plays a
+				  track/clip/pattern.
+					* Call or spawn...?
+		* Record filter configurator!
+		* Optional StopAllNotes() when looping!
+		* Timeline with tempo changes
+		* Event list editor
+			* Show:
+				* All
+				* Selected voices
+				* Selected controls
+		* Cell/pattern based song editor!
+			* Song grid with
+				* Multiple rows/layers per track
+				* Rules for combining "conflicting"
+				  controls in overlaid patterns.
+				* Select/copy/cut/paste
+				* Drag'n'drop move/copy
+				* "Linked" patterns...?
+			* Pattern editor
+				* Visualize as points, bars or curves
+					* Control events + Detach makes
+					  one curve.
+				* Color:
+					* By control
+					* By voice
+				* Show:
+					* All
+					* Selected voices
+					* Selected controls
+				* Select/copy/cut/paste
+				* Drag'n'drop move/copy
+				* Snap to grid!
+					* 1.0
+					* 1/12 (linear pitch, TTET)
+					* Various scales and tunings!
+					* N pulses
+					* Various note durations
+				* Multi-select to edit multiple
+				  patterns together?
+			* Recording:
+				* Recording "over" old material makes
+				  a new row/layer.
+				* When looping, each "wrap" results in
+				  a new row/layer.
+	* Support synth names instead of descriptors to SetInstrument()!
+	* Should SetInstrument() really be an event...?
+	* Timestamps in the SynthAPI events!?
+	* What about the freeze that happens when playing a bunch
+	  of instruments in unison on multiple channels!?
+	* Something is going very wrong when load() is used in
+	  some situations... Modules, or at least some of their
+	  objects, seem to be destroyed prematurely. (Fixed with recent
+	  EEL versions...?)
+	* What's with the sudden CPU overload in FFTSynth:Bass!?
+	* Bank Select for selecting synths, PC for presets!
+		* EBGUI:
+			* Window() generates some weird outline
+			  on Popup() when closed...!
+			* Needs input filtering for dragging!!!
+				* Dispatch() needs to know if
+				  there are more events in the
+				  queue. Alternatively, we might
+				  be able to "trigger" filtered
+				  events in Refresh()...? We can
+				  just add a DispatchDone() call
+				  or something.
+			* Region calculation breaks when rects go
+			  off-screen!
+			* Where is all the CPU time going...?
+			* Save old regions and calculate the diff
+			  for minimal updates!
+			* Do we need Close() to grab the region
+			  of the closed root widget...? No! It
+			  should be sufficient to conclude that
+			  some areas that were occluded before
+			  aren't after the rethink.
+			* Popup menu:
+				* MenuButton == SubMenu item...?
+				* GTK style "lock" feature!
+	* Transport/music time control panel!
+	* MIDI looper/sequencer with piano roll editing!
+	* Mouse capture play mode!
+	* GUI with some scopes, VU, channel status etc
+	* Move the GUI to a separate process! (Networked
+	  GUI as free bonus. ;-)
+	* RtAudio and RtMidi!!! (Put in EELBox for now...)
+	* SynthAPI:
+		* "Official" GUI solution!
+		* Music time and transport interface!
+			* Transport state.
+			* Transport position.
+			* Tempo.
+			* Time signature.
+		* What if a synth wants a detach and a new
+		  instance for every GATE on? Of course,
+		  this could be implemented all in the
+		  synth, but it would be much handier if
+		  the host could just operate the detach
+		  logic in the way the synth prefers.
+		* Maybe Channel Controls should be available
+		  to plugins, with the current way of
+		  implementing them over voice controls
+		  becomes the default fallback?
+		* Mapping for splits, drum kits etc!
+			* Allow synths of different kinds
+			  to share mixing buffers, channel
+			  state etc? (Obviously, they have
+			  to use compatible object types!)
+		* Control port query API!
+			* Should Connect be used for
+			  control ports as well...?
+		* Built-in port documentation API!
+		* Audio port query API! (Stereo etc...)
+			* Identification of custom audio
+			  formats? (Only needed if synths
+			  and other units of different
+			  kinds are to communicate using
+			  these formats.)
+		* Reset() entry point for recycling "dead"
+		  synth instances, instead of destroying
+		  and creating new instances all the time.
+		    Maybe this should provide an efficient
+		  way of initializing controls? (Handy for
+		  controls set for all voices on a
+		  channel, like most controls are handled
+		  when taking input from MIDI.)
+		* Timestamped events!
+			* Plugins supporting this would
+			  have "ControlEvent" ports.
+			* Controls are the same as for the
+			  Control() intry point.
+			* synthapi.eel can provide tools
+			  for mapping Control() calls to
+			  events, and for implementing
+			  events by means of buffer
+			  splitting and Control() calls,
+			  depending on what interfaces
+			  synths provide.
+			* Subsample accurate timestamps?
+	* Handle all MIDI messages!
+	* Map more MIDI CCs! "MIDI learn?"
+	* Channel FX inserts!
+	* Busses with bus FX!
+	* Control processors!
+	* FFTSynth:
+		* Variable framerate! This could allow
+		  sample accurate timing, while saving
+		  loads of CPU time when oscillators are
+		  realtively steady in pitch.
+		* Sound brushes and filters:
+			* Geometric waveforms
+			* Spectra
+			* Noise generators
+			* Frequency domain (FFT) filters
+			* Component domain filters:
+				* Transpose
+				* Spread/pinch/invert
+				* Warp
+				* Qantize pitch
+				* Randomize
+	* For synth editors:
+		* "Value editor" popups with various items;
+			* Long slider for values
+			* Numeric keyboard entry
+			* Various handy defaults
+			* "Previous value"
+			* Values from other presets
+			* Snapshot values?
+
+BUGS
+	* Some synths or tracks remain active after going silent,
+	  judging from the CPU load meter.
+
+	* Doing anything with a channel with no instrument
+	  loaded will most certainly bring EELSynth down!
+
+	* FFTSynth:
+		* Finish porting the presets!
+		* Add more presets!
+		* Optimize the oscillator banks!
+		* Bass preset:
+			* Lots of MOD results in massive
+			  CPU load!
+
+	* ChipVoice:
+		* Clicks! Needs envelope and stuff...
+		* Voices need common timing for LFOs etc!
+
+	* BLSaw:
+		* Clicks when restarting a playing voice
+
+	* Sine:
+		* Clicks when restarting a playing voice
+
+DESIGN ISSUES
+	* The current implementation of detached voice
+	  handling means voice processing order is pretty
+	  much undefined. No big deal normally, but what
+	  if a synth combines voices in other ways than
+	  plain additive mixing?
+
+	* Some synths rely on controls like VEL or RVEL to
+	  be set *before* GATE is changed. This is a
+	  problem when restoring cached control values and
+	  the like... Could be an issue for sequencers
+	  too.
+	    Then again, if we can live with GATE being the
+	  only "latch" type control, we can just say
+	  "always send GATE as the last event."
+	    To avoid this issue, one could just have
+	  synths handle any inter-control calculations
+	  first thing in Process(), instead of doing them
+	  inside Control(). However, that eliminates the
+	  performance benefit and simplicty of handling
+	  control events right as they're received.

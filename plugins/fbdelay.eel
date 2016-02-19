@@ -1,0 +1,118 @@
+//////////////////////////////////////////////////////
+// fbdelay.eel - Simple Feedback Delay Effect
+// Copyright (C) 2007, 2010, 2011 David Olofson
+//////////////////////////////////////////////////////
+
+module fbdelay;
+
+import "synthapi";
+
+function Create(cfg, preset)
+{
+	local t = table [
+		.fs	cfg.fs,
+		.fb	.5,
+		.cfb	.2,
+		.level	.3,
+		.ldbuf	vector [],
+		.ldpos	0,
+		.rdbuf	vector [],
+		.rdpos	0,
+		.lin	nil,
+		.rin	nil,
+		.lout	nil,
+		.rout	nil,
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case ALEFTINPUT
+				self.lin = buffer;
+			  case ARIGHTINPUT
+				self.rin = buffer;
+			  case ALEFTOUTPUT
+				self.lout = buffer;
+			  case ARIGHTOUTPUT
+				self.rout = buffer;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case "LeftDelay"
+			  {
+				local s = (integer)(value * self.fs);
+				delete(self.ldbuf);
+				self.ldbuf[s - 1] = 0.;
+				self.ldpos = 0;
+			  }
+			  case "RightDelay"
+			  {
+				local s = (integer)(value * self.fs);
+				delete(self.rdbuf);
+				self.rdbuf[s - 1] = 0.;
+				self.rdpos = 0;
+			  }
+			  case "Feedback"
+				self.fb = value;
+			  case "CrossFeedback"
+				self.cfb = value;
+			  case "Level"
+				self.level = value;
+		}
+		function Process(self, frames)
+		{
+			if not (self.lin and self.rin and self.lout and
+					self.rout)
+				return false;
+			local ldbuf = self.ldbuf;
+			local ldpos = self.ldpos;
+			local lin = self.lin;
+			local lout = self.lout;
+			local rdbuf = self.rdbuf;
+			local rdpos = self.rdpos;
+			local rin = self.rin;
+			local rout = self.rout;
+			local level = self.level;
+			local fb = self.fb;
+			local cfb = self.cfb;
+			for local s = 0, frames - 1
+			{
+				local ldout = ldbuf[ldpos];
+				local rdout = rdbuf[rdpos];
+				local ins = lin[s];
+				lout[s] += ldout * level;
+				ldbuf[ldpos] += rdout * cfb;
+				ldbuf[ldpos] *= fb;
+				ldbuf[ldpos] += ins;
+				ldpos = (ldpos + 1) % sizeof(ldbuf);
+
+				ins = rin[s];
+				rout[s] += rdout * level;
+				rdbuf[ldpos] += ldout * cfb;
+				rdbuf[rdpos] *= fb;
+				rdbuf[rdpos] += ins;
+				rdpos = (rdpos + 1) % sizeof(rdbuf);
+			}
+			self.(ldpos, rdpos) = ldpos, rdpos;
+			return true;
+		}
+	];
+	t:Control("LeftDelay", .3);
+	t:Control("RightDelay", .42);
+	// We take a table of initial controls as 'preset',
+	// so if we get one, apply it!
+	if preset
+		for local i = 0, sizeof preset - 1
+			t:Control(key(preset, i), index(preset, i));
+	return t;
+}
+
+
+export function Descriptor
+{
+	return table [
+		.Name		"Feedback Delay",
+		.Author		"David Olofson",
+		.Copyright	"Copyright (C) 2007, 2010, 2011 David Olofson",
+		.Create		Create
+	];
+}

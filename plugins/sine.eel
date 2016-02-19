@@ -1,0 +1,96 @@
+//////////////////////////////////////////////////////
+// sine.eel - Very basic test synth
+// Copyright (C) 2010 David Olofson
+//////////////////////////////////////////////////////
+
+module sine;
+
+import "synthapi";
+import "math";
+
+function Create(cfg, preset)
+{
+	local t = table [
+		.out		nil,	// Output buffer
+		.gate		0.,	// GATE
+		.vel		0.,	// VEL
+		.ff_c0		cfg.fc0 * 2. * PI / cfg.fs,	// C0
+		.ff_1		2. * PI / cfg.fs,		// 1 Hz
+		.ph		0.,	// Oscillator phase
+		.phinc		1.,	// Oscillator phase increment
+		.amp		0.,	// Amplitude
+		.vib		0.,	// Vibrato depth
+		.lfo_ph		0.,	// Vibrato LFO phase
+		procedure Connect(self, aport, buffer)
+		{
+			switch aport
+			  case AOUTPUT
+				self.out = buffer;
+		}
+		procedure Control(self, cport, value)
+		{
+			switch cport
+			  case GATE
+			  {
+				self.gate = value;
+				if value
+				{
+					// Latch velocity and reset phase!
+					self.amp = self.vel;
+					self.ph = 0.;
+					self.lfo_ph = 0.;
+				}
+			  }
+			  case VEL
+				self.vel = value;
+			  case PITCH
+				self.phinc = self.ff_c0 * 2. ** value;
+			  case MOD
+				self.vib = .1 * value ** 2.;
+		}
+		function Process(self, frames)
+		{
+			if not self.out or not self.amp
+				return false;
+			local out, local amp, local ph, local phinc =
+					self.(out, amp, ph, phinc);
+			local damp = 0.;
+			local lfo = sin(self.lfo_ph) * self.vib;
+			self.lfo_ph += self.ff_1 * 5. * frames;
+			phinc *= 1. + lfo;
+			local running = true;
+			if not self.gate
+			{
+				// Linear fade-out over one period.
+				damp = -self.vel * phinc / (2. * PI);
+				if -damp * frames >= amp
+				{
+					// We're done after this fragment!
+					damp = -amp / frames;
+					self.amp = 0.;
+					running = false;
+				}
+			}
+			for local s = 0, frames - 1
+			{
+				out[s] += sin(ph) * amp;
+				ph += phinc;
+				amp += damp;
+			}
+			self.(ph, amp) = ph, amp;
+			return running;
+		}
+	];
+	return t;
+}
+
+
+export function Descriptor
+{
+	return table [
+		.Name		"Sine",
+		.Author		"David Olofson",
+		.Copyright	"Copyright (C) 2010 David Olofson",
+		.Create		Create
+	];
+}

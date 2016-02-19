@@ -1,0 +1,546 @@
+////////////////////////////////////////////////
+// sequencer.eel - EELSynth SynthAPI Sequencer
+// Copyright (C) 2010-2011 David Olofson
+////////////////////////////////////////////////
+
+module sequencer;
+
+import "math";
+import "synthapi" as S;
+import "io" as io;
+
+
+export constant EV_CONTROL = 0;
+export constant EV_DETACH = 1;
+export constant EV_INSTRUMENT = 2;
+export constant EV_CCONTROL = 3;
+
+
+procedure checkpq(pq)
+{
+	for local i = 0, sizeof pq - 2
+		if pq[i][0] > pq[i + 1][0]
+		{
+			print("ERROR! Out of order events in the priority queue!\n");
+			for local j = 0, sizeof pq - 1
+			{
+				if j == i or j == i + 1
+					print(">>>");
+				else
+					print("   ");
+				print(j, ":\t", pq[j][0], ", ", pq[j][1], "\n");
+			}
+			print("---------\n");
+		}
+}
+
+
+function pqinsert(pq, ev)
+{
+	local when = ev[0];
+/*	local max = sizeof pq - 1;
+	if max < 1
+	{
+		if not max
+			if when <= pq[0][0]
+			{
+				insert(pq, 0, ev);
+				return 0;
+			}
+		pq.+ ev;
+		return sizeof pq - 1;
+	}
+	if when >= pq[max][0]
+	{
+		pq.+ ev;
+		return sizeof pq - 1;
+	}
+	local min, local pivot = 0;
+	while max != min
+	{
+		pivot = (integer)((min + max) / 2);
+		local ts = pq[pivot][0];
+		if ts == when
+		{
+			insert(pq, pivot, ev);	// Shortcut!
+			return pivot;
+		}
+else		if when > ts and pivot != min
+			min = pivot;
+		else
+			max = pivot;
+	}
+	if when >= pq[pivot][0]
+		pivot += 1;
+	insert(pq, pivot, ev);
+	return pivot;
+*/
+	for local i = 0, sizeof pq - 1
+		if pq[i][0] > when
+		{
+			insert(pq, i, ev);
+			return i;
+		}
+	pq.+ ev;
+	return sizeof pq - 1;
+}
+
+
+function trackSerialize(self, indent)
+{
+	local b = dstring [];
+	local s = self.sequence;
+	local lastt = nil;
+	local ic = self.icontrols;
+	if sizeof ic
+	{
+		b.+ indent;
+		b.+ "IC(";
+		for local i = 0, sizeof ic - 1
+			b.+ (string)key(ic, i) + "," +
+					(string)index(ic, i) + ", ";
+		b.+ ");\n";
+	}
+	if sizeof s
+		lastt = s[0][0];
+	b.+ indent;
+	for local i = 0, sizeof s - 1
+	{
+		local ev = s[i];
+		if ev[0] != lastt	// Different timestamp ==> new line!
+		{
+			lastt = ev[0];
+			b.+ "\n";
+			b.+ indent;
+		}
+		switch ev[1]
+		  case EV_CONTROL
+			b.+ "C(";
+		  case EV_DETACH
+			b.+ "D(";
+		  case EV_INSTRUMENT
+			b.+ "I(";
+		  case EV_CCONTROL
+			b.+ "CC(";
+		b.+ (string)ev[0];
+		b.+ ",";
+		switch ev[1]
+		  case EV_CONTROL
+			b.+ (string)ev[2] + "," +
+					(string)ev[3] + "," +
+					(string)ev[4];
+		  case EV_DETACH
+			b.+ (string)ev[2];
+		  case EV_INSTRUMENT
+			b.+ "\"" + ev[2] + "\",\"" +
+					(string)ev[3] + "\"";
+		  case EV_CCONTROL
+			b.+ (string)ev[2] + "," +
+					(string)ev[3];
+/*		if ev[0] != lastt
+		{
+			// Different timestamp ==> new line!
+			lastt = ev[0];
+			b.+ ");\n";
+			b.+ indent;
+		}
+		else*/
+		b.+ "); ";
+	}
+	b.+ "\n";
+	return b;
+}
+
+
+// Add a sequencer track
+function AddTrack(seq)
+{
+	local tr = table [
+		.target		nil,
+		.play		true,
+		.sequence	[],	// Event database
+		.now		-1,	// Current time (pulses)
+		.playpos	0,	// Playback position (index)
+		.icontrols	table [],
+
+		// Connect to control interface 'target'.
+		procedure Connect(self, target)
+		{
+			self.target = target;
+		}
+
+		// Move play position to 'time' (pulses).
+		procedure Skip(self, time)
+		{
+//FIXME: Smarter algorithm...
+			self.now = time;
+			self.playpos = 0;
+			local s = self.sequence;
+			for local pp = 0, sizeof s - 1
+				if s[pp][0] >= time
+				{
+					self.playpos = pp;
+					break;
+				}
+			if not self.now
+				self:InitControls();
+		}
+
+		// Apply initial control values
+		procedure InitControls(self)
+		{
+			local ic = self.icontrols;
+			for local i = 0, sizeof ic - 1
+				self.target.Control(-1, key(ic, i),
+						index(ic, i));
+		}
+
+		// UnGATE and detach any playing voices!
+		procedure StopAllNotes(self)
+		{
+			self.target:Control(-1, S.GATE, 0.);
+			self.target:Detach(-1);
+		}
+
+		// Play from .now to 'time' (pulses).
+		procedure Play(self, time)
+		{
+			local s = self.sequence;
+			local pp = self.playpos;
+			while pp < sizeof s
+			{
+				local ev = s[pp];
+				if ev[0] >= time
+					break;
+				if self.play
+					self:Issue(ev);
+				pp += 1;
+			}
+			self.now = time;
+			self.playpos = pp;
+		}
+
+//TODO: Use a selection table instead, with various selection tools + various
+//TODO: operations to perform on the selection - GIMP/PhotoShop style!
+		procedure Delete(self)[pos, to]
+		{
+			if not sizeof self.sequence
+				return;
+			if specified pos
+				local i0, local i1 = pos;
+			else
+				i0, i1 = 0, sizeof self.sequence;
+			if specified to
+				i1 = to;
+			i0 = 0 >| i0 |< sizeof self.sequence;
+			i1 = i0 >| i1 |< sizeof self.sequence;
+			delete(self.sequence, i0, i1 - i0);
+//FIXME: Untested...
+			if self.playpos > i0
+			{
+				if self.playpos < i1
+					self.playpos = i0;
+				else
+					self.playpos -= i1 - i0;
+			}
+		}
+
+		// Pass events to the target
+		procedure Issue(self, ev)
+		{
+			local tt = self.target;
+			switch ev[1]
+			  case EV_CONTROL
+				tt:Control(ev[2, 3, 4]);
+			  case EV_DETACH
+				tt:Detach(ev[2]);
+			  case EV_INSTRUMENT
+				tt:Instrument(ev[2, 3]);
+			  case EV_CCONTROL
+				tt:CControl(ev[2, 3]);
+		}
+
+		// Handle incoming events
+		procedure Feed(self, ev)
+		{
+			local e = ev;
+			local s = self.sequencer;
+
+			// Feed live evenst through to synths
+			if s.thru
+				self:Issue(e);
+
+			// Recording?
+			if not s.record
+				return;		// Nope, we're done!
+
+			// Event filters
+			if e[1] < sizeof s.efilter
+				if s.efilter[e[1]]
+					return;
+			if e[1] == EV_CONTROL
+				if e[3] < sizeof s.cfilter
+					if s.cfilter[e[3]]
+						return;
+
+			// Recording but not playing? Set initial controls!
+			// NOTE:
+			//	Voice controls become channel wide, ie "-1"!
+			if not s.play
+			{
+				if e[1] != EV_CONTROL
+					return;
+				self.icontrols[e[3]] = e[4];
+				return;
+			}
+
+			// Quantization
+			if s.quantize
+			{
+				e = clone e;
+				e[0] = floor((e[0] + s.quantize / 2) /
+						s.quantize) * s.quantize;
+			}
+
+			// Looping
+			if s.loop
+			{
+				e[0] -= s.start;
+				e[0] %= s.loop - s.start;
+				e[0] += s.start;
+			}
+
+			// Insert in track!
+			self:Insert(e);
+		}
+
+		procedure Insert(self, ev)
+		{
+			if pqinsert(self.sequence, ev) < self.playpos
+				self.playpos += 1;
+		}
+
+		// SynthAPI interface to Feed()
+
+		procedure Control(self, vvoice, cport, value)
+		{
+			self:Feed([self.sequencer.now,
+					EV_CONTROL, vvoice, cport, value]);
+		}
+
+		procedure Detach(self, vvoice)
+		{
+			self:Feed([self.sequencer.now,
+					EV_DETACH, vvoice]);
+		}
+
+		procedure Instrument(self, name)[preset]
+		{
+			if specified preset
+				local pres = preset;
+			else
+				pres = "Default";
+			self:Feed([self.sequencer.now,
+					EV_INSTRUMENT, name, pres]);
+		}
+
+		procedure CControl(self, cport, value)
+		{
+			self:Feed([self.sequencer.now,
+					EV_CCONTROL, cport, value]);
+		}
+
+		// File/data I/O
+		.Serialize	trackSerialize
+	];
+	tr.sequencer (=) seq;
+	seq.tracks.+ tr;
+	return tr;
+}
+
+
+///////////////////////////////////////////////////////////////
+// Indonesian synth project demo song
+///////////////////////////////////////////////////////////////
+procedure SongStep(seq)
+{
+	local st = seq.tracks;
+	for local i = 0, sizeof st - 1
+		st[i].play = false;
+	switch seq.songpos
+		case 0
+			st[0, 2].play = true;
+		case 1
+			st[0, 1, 2].play = true;
+		case 2
+			st[0, 1, 2, 3].play = true;
+		case 3
+			st[0, 1, 2, 5].play = true;
+		case 4
+			st[0, 1, 4, 6].play = true;
+		case 5
+			st[0, 1, 2].play = true;
+		case 6
+			st[0, 1, 6].play = true;
+	seq.songpos += 1;
+}
+///////////////////////////////////////////////////////////////
+
+
+export function New
+{
+	local t = table [
+		// Settings
+		.record		true,	// Recording?
+		.play		true,	// Playing back?
+		.thru		true,	// Pass events through to target?
+
+		.tempo		1000,	// Pulses per second
+
+		.beat		480,	// Pulses per beat
+		.measure	1920,	// Pulses per measure
+
+		.start		0,	// Start/loop start time
+		.loop		0,	// Loop end time (exclusive), or 0
+		.loopreset	false,	// Stop all notes when restarting loop
+
+/////////////////////////////////////
+//.songpos	0,
+//.SongStep	SongStep,
+/////////////////////////////////////
+
+		.quantize	120,	// Record time quantization
+
+		// Record filter
+		.efilter	vector_u8 [],
+		.cfilter	vector_u8 [],
+
+		.metro		480,	// Metronome period
+		.metrotick	0,	// Set by Process() if there was a
+					// metronome tick. 1 for normal, 2 for
+					// first tick in measure.
+
+		.tracks		[],	// Sequencer tracks (interfaces + state)
+
+		// State
+		.now		-1,	// Playback timestamp
+
+		.AddTrack	AddTrack,
+
+		// Move play position to 'time' (pulses).
+		procedure Skip(self, time)
+		{
+			local tr = self.tracks;
+			for local i = 0, sizeof tr - 1
+				tr[i]:Skip(time);
+			self.now = time;
+		}
+
+		// Play from .now to 'time' (pulses).
+		procedure Play(self, time)
+		{
+			if self.metro
+			{
+				local mt = self.metro;
+				local ms = self.measure;
+				local lasttime = self.now;
+				if floor(time / mt) != floor(lasttime / mt)
+					if floor(time / ms) !=
+							floor(lasttime / ms)
+						self.metrotick = 2;
+					else
+						self.metrotick = 1;
+			}
+			local tr = self.tracks;
+			for local i = 0, sizeof tr - 1
+				tr[i]:Play(time);
+			self.now = time;
+		}
+
+		// Stop (unGATE and Detach()) all playing notes in all tracks.
+		procedure StopAllNotes(self)
+		{
+			local tr = self.tracks;
+			for local i = 0, sizeof tr - 1
+				tr[i]:StopAllNotes();
+		}
+
+		// Process all tracks for 'dt' seconds!
+		procedure Process(self, dt)
+		{
+			self.metrotick = 0;
+			if not self.play
+				return;
+			local time = self.now + self.tempo * dt;
+			if self.loop
+			{
+				time -= self.start;
+				time %= self.loop - self.start;
+				time += self.start;
+			}
+			if time < self.now
+			{
+				// Loop!
+				self:Play(self.loop);	// Last few...
+				if self.loopreset
+					self:StopAllNotes();
+				self:Skip(self.start);
+///////////////////////////////////////////////////////////////
+//				self:SongStep();
+///////////////////////////////////////////////////////////////
+			}
+			self:Play(time);
+		}
+
+		// Convert pulses to bar:beat:pulse notation
+		function Pulses2BBP(self, t)
+		{
+			local bar = floor(t / self.measure);
+			t -= bar * self.measure;
+			local beat = floor(t / self.beat);
+			t -= beat * self.beat;
+			local pulse = floor(t + .5);
+			local buf = dstring [];
+			buf.+ (dstring)bar;
+			buf.+ ':';
+			buf.+ (dstring)(beat + 1);
+			buf.+ ':';
+			buf.+ (dstring)pulse;
+			return buf;
+		}
+
+		function Serialize(self)
+		{
+			local b = dstring [];
+			b.+ "Generator(\"EELSynth 0.1\");\n";
+			b.+ "Format(\"ESS\", 0);\n";
+			b.+ "Tempo(" + (dstring)self.tempo + ");\n";
+			b.+ "TimeSig(" + (dstring)self.beat + "," +
+					(dstring)self.measure + ");\n";
+			b.+ "Loop(" + (dstring)self.start + "," +
+					(dstring)self.loop + ");\n";
+			for local i = 0, sizeof self.tracks - 1
+			{
+				if not sizeof self.tracks[i].sequence
+					continue;
+				b.+ "\nTrack(", (dstring)i, ");\n";
+				b.+ self.tracks[i]:Serialize("\t");
+			}
+			return b;
+		}
+
+		procedure Deserialize(self, song)
+		{
+			local b = dstring [];
+			local f = file ["sequencer_ESS_0.eel", "rb"];
+//FIXME: Somehow extract and check the Format() item, to
+//FIXME: pick the right header for parsing the file.
+			b.+ io.read(f, sizeof f);
+			b.+ song;
+			b.+ "}\n";
+			local sm = compile(b);
+			sm.Process(self);
+		}
+	];
+	return t;
+}

@@ -1,0 +1,236 @@
+//////////////////////////////////////////////////////
+// synthapi.eel - Synth API definition for EELSynth
+// Copyright (C) 2010 David Olofson
+//////////////////////////////////////////////////////
+//
+//	An EELSynth synth is an object implemented as
+//	an EEL table, providing a uniform interface.
+//	This file documents this interface, defines
+//	API constants and provides some debugging and
+//	testing tools.
+//
+// Configuration Table
+//	This is an EEL table containing the following
+//	fields:
+//		fc0	Frequency of C0 (Hz)
+//			A linear pitch value of 0.0
+//			corresponds to this frequency.
+//			Can be used for tuning.
+//
+//		fs	Audio sample rate (Hz)
+//
+//		buffer	Output audio buffer size
+//			Process() calls should NEVER
+//			be called with a 'frames'
+//			argument higher than this!
+//
+// Instantiation
+//	Synths are instantiated in the usual "table
+//	based" OOP way, by means of a function that
+//	constructs and returns an EEL table that holds
+//	the implementation and it's interface.
+//	  A synth constructor is expected to accept
+//	two arguments, one configuration table and one
+//	preset object. The latter can in fact be of
+//	any type, including nil, if presets are not
+//	supported. A synth host may keep the preset
+//	object around along with the constructor for
+//	instantiating synths as needed, and synths
+//	must expect to share preset objects.
+//
+// Presets
+//	Synths may accept presets as instantiation
+//	argumets (see "Instantiation"), and presets
+//	may be provided by the Descriptor through
+//	the following optional methods:
+//	  function ListPresets(self)
+//		Compile a list of all available
+//		presets and return it in the form of
+//		an array of names.
+//	  function GetPreset(self, name)
+//		Create (or just return) the named
+//		preset object. Passing "Default" for
+//		'name' should return a working default
+//		preset!
+//		
+//	  If a Descriptor does not provide these
+//	methods, it is assumed that the synth does not
+//	support presets, and Create() will be called
+//	with nil for 'preset'.
+//
+// Packaging
+//	Although synth constructors can be implemented
+//	as normal functions located anywhere, the
+//	recommended convention is to implement a synth
+//	as a module, exporting one entry point named
+//	Descriptor() which returns a Synth Descriptor
+//	table, containing various information and
+//	entry points, including a Create() method,
+//	which is the synth instance constructor.
+//	  Note that different variants of a synth
+//	could still be implemented in one module, by
+//	indicating the desired variant through the
+//	'opts' argument to Create().
+//
+// Synth Descriptor
+//	An EEL table describing to the host (and user)
+//	how to instantiate and operate a synth.
+//
+//
+// Control
+//	Synths are controlled through the Control()
+//	method, that takes an integer port index and
+//	a real (ie floating point) value.
+//	  Some useful standard port indices are
+//	defined here, but synths may add more if
+//	needed.
+//	  Control values should preferably be in the
+//	[0, 1] or [-1, 1] range if they have no real
+//	unit. The API defined standard ports have
+//	units specified in the documentation, and
+//	synths should stick with these units.
+//	  Unlike MIDI, the synth API does not have
+//	special events for NoteOn, NoteOff and so on,
+//	but relies entirely on controls.
+//	  The NoteOn/NoteOff logic is implemented by
+//	means of the GATE port, which should handle
+//	0. as "off" and any non-zero value as "on".
+//	When handling GATE changes, velocity sensitive
+//	synths are expected to consider the VEL and
+//	RVEL ports for velocity and release velocity
+//	information.
+//	  Pitch - note and bend alike - is handled
+//	by the PITCH port.
+//
+// Output
+//	Synths normally output audio by mixing their
+//	output into EEL vectors (real numbers),
+//	specified through the Connect() method.
+//	  Synths must run properly even if ports
+//	are left disconnected!
+//	  As of now, the EELSynth host application
+//	will only connect the AOUTPUT port.
+//
+// Special audio formats
+//	Synths may use special audio formats and
+//	protocols, such as FFT spectra. For the host
+//	to support this, the synth has to provide
+//	additional entry points in the descriptor;
+//	  function CreateBuffer(cfg)
+//		Returns a suitable object that audio
+//		output ports of a synth instance can
+//		be connected to with Connect().
+//	  procedure ClearBuffer(buffer)
+//		Clears a custom format audio buffer
+//		before running the synth voices.
+//	  procedure ConvertBuffer(buffer, output)
+//		Converts a buffer of the synth's
+//		custom audio format into normal audio,
+//		writing it into the vector 'output'.
+//	NOTE: These entry points are plain functions,
+//	      NOT methods of the descriptor!
+//
+// Input
+//	Synths may take input audio for processing by
+//	providing audio input ports. These are
+//	connected using the same Connect() method as
+//	used for audio output.
+//	  Audio input and output ports live in the
+//	same index space!
+//
+// Processing
+//	Audio processing is done in the Process()
+//	method, which takes the number of audio sample
+//	frames to process as the argument, and returns
+//	true if the synth has more audio to output,
+//	given the current state of controls.
+//	  After returning false from Process(), a
+//	synth instance may or may not be destroyed by
+//	the host - make no assumptions!
+//
+// "Channel wide" state and processing
+//	Synth instances within a channel (or similar
+//	host side grouping) may share state by adding
+//	a method
+//	  function CreateSharedState(cfg)
+//	to the descriptor, and providing a method
+//	  procedure SetSharedState(state)
+//	to each synth instance.
+//
+// Units
+//	* Linear pitch
+//		1.0/octave, 0 <==> middle C
+//
+//////////////////////////////////////////////////////
+
+module synthapi;
+
+  ///////////////////////////////////////
+ // Useful constants
+///////////////////////////////////////
+
+// Frequency of middle C, which is the reference value for linear pitch,
+// that is, linear pitch 0.0 corresponds to this frequency.
+export constant DEFAULT_FC0 = 261.625565;
+
+
+  ///////////////////////////////////////
+ // Standard control ports
+///////////////////////////////////////
+
+// Gating and modulation control ports
+export constant GATE = 0;	// Gate switch for note on/off logic
+export constant VEL = 1;	// Velocity ([0, 1])
+export constant RVEL = 2;	// Release velocity ([0, 1])
+export constant MOD = 3;	// Modulation ([0, 1])
+export constant EXPR = 4;	// Expression ([0, 1])
+export constant DEPTH = 5;	// Depth ([0, 1])
+export constant CUTOFF = 6;	// Cutoff frequency (linear pitch)
+
+// Pitch control ports
+// (Secondary, tertiary etc are for harmonics, arpeggios etc)
+export constant PITCH = 8;	// Primary note pitch (linear pitch)
+export constant PITCH2 = 9;	// Secondary note pitch (linear pitch)
+export constant PITCH3 = 10;	// Tertiary note pitch (linear pitch)
+export constant PITCH4 = 11;	// Quaternary note pitch (linear pitch)
+export constant PITCH5 = 12;	// Quinary note pitch (linear pitch)
+export constant PITCH6 = 13;	// Senary note pitch (linear pitch)
+export constant PITCH7 = 14;	// Septenary note pitch (linear pitch)
+export constant PITCH8 = 15;	// Octonary note pitch (linear pitch)
+
+// Start of custom control ports
+// (Non-standard ports should start at this index)
+export constant USER = 16;
+
+
+  ///////////////////////////////////////
+ // Standard audio ports
+///////////////////////////////////////
+
+export constant AINPUT = 0;
+export constant AOUTPUT = 1;
+export constant ALEFTINPUT = 2;
+export constant ARIGHTINPUT = 3;
+export constant ALEFTOUTPUT = 4;
+export constant ARIGHTOUTPUT = 5;
+
+
+  ///////////////////////////////////////
+ // Handy helpers
+///////////////////////////////////////
+
+export function DefaultConfig
+{
+	return table [
+		.fc0	DEFAULT_FC0,
+		.fs	44100,	// Output sample rate (Hz)
+		.buffer	512,	// Buffer size (sample frames)
+	];
+}
+
+
+export procedure ConnectMany(unit)<port, buffer>
+{
+	for local i = 0, tuples - 1
+		unit:Connect(port[i], buffer[i]);
+}
